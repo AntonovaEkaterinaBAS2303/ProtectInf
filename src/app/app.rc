@@ -1,18 +1,11 @@
 #include <windows.h>
 
-#ifndef IDC_TRAYAPP
 #define IDC_TRAYAPP 101
-#endif
 
-#ifndef IDI_TRAYAPP
-#define IDI_TRAYAPP 102
-#endif
-
-// Menu resource
 IDC_TRAYAPP MENU
 BEGIN
 POPUP "File"
 BEGIN
-MENUITEM "Exit", 2001
+MENUITEM "Exit (Stop Service)", 2001
 END
 END

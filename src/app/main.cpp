@@ -1,56 +1,39 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
-#include <rpc.h>
 #include <tchar.h>
-#include <string>
 #include <tlhelp32.h>
 
-#pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// RPC заглушки (обычно генерируются MIDL, но для простоты объявим вручную)
-extern "C" {
-    void StopService();
-    int CheckServiceStatus();
-}
-
-// Resource identifiers
-#define IDC_TRAYAPP 101
-#define IDI_TRAYAPP 102
-
-// Constants
 #define WM_TRAYICON (WM_APP + 1)
 #define ID_TRAY_ICON 1
 #define IDM_OPEN 1001
 #define IDM_EXIT 1002
 #define ID_FILE_EXIT 2001
-
+#define IDC_TRAYAPP 101
 #define SERVICE_NAME L"TrayAppService"
 
-// Global variables
 HINSTANCE g_hInstance = NULL;
 HWND g_hWnd = NULL;
 NOTIFYICONDATA g_nid = {};
+UINT g_uTaskbarRestart = 0;
 bool g_bMainWindowVisible = false;
 HANDLE g_hMutex = NULL;
-UINT g_uTaskbarRestart = 0;
-RPC_WSTR g_szStringBinding = NULL;
-handle_t g_hRpcBinding = NULL;
 
 // Function declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-BOOL InitInstance(HINSTANCE, int);
 void AddTrayIcon(HWND hWnd);
 void RemoveTrayIcon();
 void ShowContextMenu(HWND hWnd);
 void ShowMainWindow(HWND hWnd);
-ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL CheckParentProcess();
 BOOL EnsureServiceRunning();
 void StopWindowsService();
-BOOL InitRpcClient();
+void StartServiceIfNeeded();
 
+// Check if parent process is TrayService.exe
 DWORD GetParentProcessId()
 {
     DWORD ppid = 0;
@@ -85,14 +68,13 @@ BOOL CheckParentProcess()
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ppid);
     if (!hProcess) return FALSE;
 
-    WCHAR szName[MAX_PATH];
+    TCHAR szName[MAX_PATH];
     DWORD dwSize = MAX_PATH;
     BOOL bResult = QueryFullProcessImageName(hProcess, 0, szName, &dwSize);
     CloseHandle(hProcess);
 
     if (!bResult) return FALSE;
 
-    // Проверить, что родительский процесс - наша служба
     return (_tcsstr(szName, _T("TrayService.exe")) != NULL);
 }
 
@@ -101,7 +83,7 @@ BOOL EnsureServiceRunning()
     SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
     if (!hSCManager) return FALSE;
 
-    SC_HANDLE hService = OpenService(hSCManager, SERVICE_NAME, SERVICE_QUERY_STATUS | SERVICE_START);
+    SC_HANDLE hService = OpenService(hSCManager, SERVICE_NAME, SERVICE_QUERY_STATUS);
     if (!hService)
     {
         CloseServiceHandle(hSCManager);
@@ -109,129 +91,103 @@ BOOL EnsureServiceRunning()
     }
 
     SERVICE_STATUS ssStatus;
-    if (!QueryServiceStatus(hService, &ssStatus))
-    {
-        CloseServiceHandle(hService);
-        CloseServiceHandle(hSCManager);
-        return FALSE;
-    }
+    BOOL bResult = FALSE;
 
-    if (ssStatus.dwCurrentState == SERVICE_STOPPED)
+    if (QueryServiceStatus(hService, &ssStatus))
     {
-        // Запустить службу
-        StartService(hService, 0, NULL);
-
-        // Ждать запуска
-        for (int i = 0; i < 30; i++)
-        {
-            Sleep(1000);
-            if (QueryServiceStatus(hService, &ssStatus) &&
-                ssStatus.dwCurrentState == SERVICE_RUNNING)
-            {
-                CloseServiceHandle(hService);
-                CloseServiceHandle(hSCManager);
-                return TRUE;
-            }
-        }
-    }
-    else if (ssStatus.dwCurrentState == SERVICE_RUNNING)
-    {
-        CloseServiceHandle(hService);
-        CloseServiceHandle(hSCManager);
-        return TRUE;
+        bResult = (ssStatus.dwCurrentState == SERVICE_RUNNING);
     }
 
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
-    return FALSE;
+    return bResult;
 }
 
-void StopWindowsService()
+void StartServiceIfNeeded()
 {
     SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
     if (!hSCManager) return;
 
-    SC_HANDLE hService = OpenService(hSCManager, SERVICE_NAME, SERVICE_STOP | SERVICE_QUERY_STATUS);
-    if (!hService)
+    SC_HANDLE hService = OpenService(hSCManager, SERVICE_NAME, SERVICE_START);
+    if (hService)
     {
-        CloseServiceHandle(hSCManager);
-        return;
+        StartService(hService, 0, NULL);
+        CloseServiceHandle(hService);
     }
-
-    SERVICE_STATUS ssStatus;
-    ControlService(hService, SERVICE_CONTROL_STOP, &ssStatus);
-
-    CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
 }
 
-BOOL InitRpcClient()
+void StopWindowsService()
 {
-    RPC_STATUS status;
-
-    // Создать строку привязки
-    status = RpcStringBindingCompose(
-        NULL,
-        (RPC_WSTR)L"ncalrpc",
-        NULL,
-        (RPC_WSTR)L"TrayAppServiceRPC",
-        NULL,
-        &g_szStringBinding
-    );
-
-    if (status != RPC_S_OK) return FALSE;
-
-    // Создать привязку
-    status = RpcBindingFromStringBinding(
-        g_szStringBinding,
-        &g_hRpcBinding
-    );
-
-    return (status == RPC_S_OK);
+    SC_HANDLE hSCM = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (hSCM)
+    {
+        SC_HANDLE hSvc = OpenService(hSCM, SERVICE_NAME, SERVICE_STOP);
+        if (hSvc)
+        {
+            SERVICE_STATUS ss = { 0 };
+            ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);
+            CloseServiceHandle(hSvc);
+        }
+        CloseServiceHandle(hSCM);
+    }
 }
 
-int APIENTRY _tWinMain(HINSTANCE hInstance,
-    HINSTANCE hPrevInstance,
-    LPTSTR lpCmdLine,
-    int nCmdShow)
+int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpCmdLine, int nCmdShow)
 {
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
+    // === INITIALIZE WINDOW FIRST - BEFORE ANY CHECKS ===
+    g_hInstance = hInstance;
+    InitCommonControls();
 
-    // Проверить, что приложение запущено службой
-    if (!CheckParentProcess())
-    {
-        // Проверить состояние службы
-        if (!EnsureServiceRunning())
-        {
-            MessageBox(NULL, _T("Failed to start service"), _T("Error"), MB_OK | MB_ICONERROR);
-        }
-        return 0; // Завершить работу
-    }
+    WNDCLASSEX wc = { sizeof(wc) };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszMenuName = MAKEINTRESOURCE(IDC_TRAYAPP);
+    wc.lpszClassName = _T("TrayAppClass");
+    wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
 
-    // Инициализация RPC клиента
-    InitRpcClient();
+    if (!RegisterClassEx(&wc)) return 1;
 
-    // Проверка на повторный запуск
+    g_hWnd = CreateWindow(_T("TrayAppClass"), _T("TrayApp"), WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, 400, 300, NULL, NULL, hInstance, NULL);
+
+    if (!g_hWnd) return 1;
+
+    // Add tray icon IMMEDIATELY
+    g_uTaskbarRestart = RegisterWindowMessage(_T("TaskbarCreated"));
+    AddTrayIcon(g_hWnd);
+
+    // === NOW DO THE CHECKS ===
+    // Single instance check
     g_hMutex = CreateMutex(NULL, FALSE, _T("Global\\TrayApp_SingleInstance_Mutex"));
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
+        // Already running - exit gracefully
+        DestroyWindow(g_hWnd);
         CloseHandle(g_hMutex);
         return 0;
     }
 
-    InitCommonControls();
-    g_hInstance = hInstance;
-    MyRegisterClass(hInstance);
+    // Check if launched by service
+    BOOL bLaunchedByService = CheckParentProcess();
 
-    if (!InitInstance(hInstance, SW_HIDE))
+    if (!bLaunchedByService)
     {
-        CloseHandle(g_hMutex);
-        return FALSE;
+        if (!EnsureServiceRunning())
+        {
+            StartServiceIfNeeded();
+            Sleep(3000);
+        }
+
+        // Even if not launched by service, show the tray icon
+        // (for debugging purposes)
+        // return 0; // REMOVED - don't exit!
     }
 
-    g_uTaskbarRestart = RegisterWindowMessage(_T("TaskbarCreated"));
-    AddTrayIcon(g_hWnd);
+    g_bMainWindowVisible = false;
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
@@ -240,85 +196,25 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
         DispatchMessage(&msg);
     }
 
-    // Очистка RPC
-    if (g_hRpcBinding)
-    {
-        RpcBindingFree(&g_hRpcBinding);
-    }
-    if (g_szStringBinding)
-    {
-        RpcStringFree(&g_szStringBinding);
-    }
-
     CloseHandle(g_hMutex);
     return (int)msg.wParam;
 }
 
-ATOM MyRegisterClass(HINSTANCE hInstance)
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    WNDCLASSEX wcex = { 0 };
-    wcex.cbSize = sizeof(WNDCLASSEX);
-    wcex.lpfnWndProc = WndProc;
-    wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(hInstance, IDI_APPLICATION);
-    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wcex.lpszMenuName = MAKEINTRESOURCE(IDC_TRAYAPP);
-    wcex.lpszClassName = _T("TrayAppClass");
-    wcex.hIconSm = LoadIcon(wcex.hInstance, IDI_APPLICATION);
-
-    return RegisterClassEx(&wcex);
-}
-
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
-{
-    g_hWnd = CreateWindow(
-        _T("TrayAppClass"),
-        _T("Tray Application"),
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
-        NULL, NULL, hInstance, NULL
-    );
-
-    if (!g_hWnd) return FALSE;
-
-    if (nCmdShow == SW_SHOW)
-    {
-        ShowWindow(g_hWnd, nCmdShow);
-        UpdateWindow(g_hWnd);
-        g_bMainWindowVisible = true;
-    }
-
-    return TRUE;
-}
-
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch (message)
+    switch (msg)
     {
     case WM_TRAYICON:
-        switch (lParam)
-        {
-        case WM_LBUTTONUP:
-            ShowMainWindow(hWnd);
-            break;
-        case WM_RBUTTONUP:
-            ShowContextMenu(hWnd);
-            break;
-        }
+        if (lParam == WM_LBUTTONUP) ShowMainWindow(hWnd);
+        if (lParam == WM_RBUTTONUP) ShowContextMenu(hWnd);
         break;
 
     case WM_COMMAND:
-        switch (LOWORD(wParam))
+        if (LOWORD(wParam) == IDM_OPEN) ShowMainWindow(hWnd);
+        if (LOWORD(wParam) == IDM_EXIT || LOWORD(wParam) == ID_FILE_EXIT)
         {
-        case IDM_OPEN:
-            ShowMainWindow(hWnd);
-            break;
-        case IDM_EXIT:
-        case ID_FILE_EXIT:
             StopWindowsService();
             DestroyWindow(hWnd);
-            break;
         }
         break;
 
@@ -333,11 +229,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
 
     default:
-        if (message == g_uTaskbarRestart)
-        {
-            AddTrayIcon(hWnd);
-        }
-        return DefWindowProc(hWnd, message, wParam, lParam);
+        if (msg == g_uTaskbarRestart) AddTrayIcon(hWnd);
+        return DefWindowProc(hWnd, msg, wParam, lParam);
     }
     return 0;
 }
@@ -350,7 +243,7 @@ void AddTrayIcon(HWND hWnd)
     g_nid.uID = ID_TRAY_ICON;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIcon(g_hInstance, IDI_APPLICATION);
+    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     _tcscpy_s(g_nid.szTip, _T("Tray App Service"));
     Shell_NotifyIcon(NIM_ADD, &g_nid);
 }
@@ -364,14 +257,12 @@ void ShowContextMenu(HWND hWnd)
 {
     POINT pt;
     GetCursorPos(&pt);
-
     HMENU hMenu = CreatePopupMenu();
     InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN, _T("Open"));
     InsertMenu(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
     InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, _T("Exit (Stop Service)"));
-
     SetForegroundWindow(hWnd);
-    TrackPopupMenu(hMenu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, NULL);
+    TrackPopupMenu(hMenu, TPM_RIGHTALIGN, pt.x, pt.y, 0, hWnd, NULL);
     PostMessage(hWnd, WM_NULL, 0, 0);
     DestroyMenu(hMenu);
 }
