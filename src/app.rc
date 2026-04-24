@@ -1,48 +1,18 @@
 #include <windows.h>
-#include "resource.h"
 
-// Application icon (if you have one, otherwise use default)
-// IDI_TRAYAPP ICON "app.ico"
+#ifndef IDC_TRAYAPP
+#define IDC_TRAYAPP 101
+#endif
+
+#ifndef IDI_TRAYAPP
+#define IDI_TRAYAPP 102
+#endif
 
 // Menu resource
 IDC_TRAYAPP MENU
 BEGIN
-POPUP "Файл"
+POPUP "File"
 BEGIN
-MENUITEM "Выход", 2001
-END
-END
-
-// Version info
-VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1, 0, 0, 0
-PRODUCTVERSION 1, 0, 0, 0
-FILEFLAGSMASK 0x3fL
-#ifdef _DEBUG
-FILEFLAGS 0x1L
-#else
-FILEFLAGS 0x0L
-#endif
-FILEOS 0x40004L
-FILETYPE 0x1L
-FILESUBTYPE 0x0L
-BEGIN
-BLOCK "StringFileInfo"
-BEGIN
-BLOCK "040904B0"
-BEGIN
-VALUE "CompanyName", "Your Company"
-VALUE "FileDescription", "Tray Application"
-VALUE "FileVersion", "1.0.0.0"
-VALUE "InternalName", "TrayApp"
-VALUE "LegalCopyright", "Copyright (C) 2024"
-VALUE "OriginalFilename", "TrayApp.exe"
-VALUE "ProductName", "Tray Application"
-VALUE "ProductVersion", "1.0.0.0"
-END
-END
-BLOCK "VarFileInfo"
-BEGIN
-VALUE "Translation", 0x409, 1200
+MENUITEM "Exit", 2001
 END
 END
