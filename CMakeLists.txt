@@ -5,17 +5,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(WIN32)
-    # ========== Windows Service ==========
     add_executable(TrayService WIN32
-        src/service/service_main.cpp
-        src/common/rpc_server.c
+    src/service/service_main.cpp
+    src/common/rpc_s.c
     )
     
     target_compile_definitions(TrayService PRIVATE
-        UNICODE
-        _UNICODE
-        WIN32_LEAN_AND_MEAN
-        _CRT_SECURE_NO_WARNINGS
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
     
     target_include_directories(TrayService PRIVATE
@@ -27,17 +23,14 @@ if(WIN32)
         advapi32 user32 kernel32 wtsapi32 userenv rpcrt4
     )
     
-    # ========== GUI Application ==========
     add_executable(TrayApp WIN32
-        src/app/main.cpp
-        src/app/app.rc
+    src/app/main.cpp
+    src/app/app.rc
+    src/common/rpc_c.c
     )
     
     target_compile_definitions(TrayApp PRIVATE
-        UNICODE
-        _UNICODE
-        WIN32_LEAN_AND_MEAN
-        _CRT_SECURE_NO_WARNINGS
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
     
     target_include_directories(TrayApp PRIVATE

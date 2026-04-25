@@ -13,6 +13,8 @@
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "rpcrt4.lib")
 
+#include "../common/service_rpc.h"
+
 #define SERVICE_NAME L"TrayAppService"
 
 void LogToFile(const wchar_t* msg)
@@ -34,6 +36,66 @@ HANDLE g_ServiceStopEvent = NULL;
 std::map<DWORD, std::vector<HANDLE>> g_SessionProcesses;
 std::mutex g_ProcessMutex;
 
+// RPC Interface Implementation
+void StopService(handle_t h)
+{
+    (void)h;
+    LogToFile(L"RPC: StopService called by client");
+    if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
+}
+
+long GetStatus(handle_t h)
+{
+    (void)h;
+    return g_ServiceStatus.dwCurrentState;
+}
+
+void Shutdown(handle_t h)
+{
+    StopService(h);
+}
+
+// RPC Server Thread
+DWORD WINAPI RpcServerThread(LPVOID lp)
+{
+    (void)lp;
+    LogToFile(L"RPC: Starting ALPC server...");
+
+    RPC_STATUS status = RpcServerUseProtseqEpW(
+        (RPC_WSTR)L"ncalrpc",
+        RPC_C_PROTSEQ_MAX_REQS_DEFAULT,
+        (RPC_WSTR)L"TrayAppServiceRPC",
+        NULL
+    );
+
+    wchar_t buf[100];
+    wsprintf(buf, L"RPC: UseProtseqEp=%d", (int)status);
+    LogToFile(buf);
+
+    if (status == RPC_S_OK || status == RPC_S_DUPLICATE_ENDPOINT)
+    {
+        status = RpcServerRegisterIf(
+            ServiceControl_v1_0_s_ifspec,
+            NULL,
+            NULL
+        );
+        wsprintf(buf, L"RPC: RegisterIf=%d", (int)status);
+        LogToFile(buf);
+
+        if (status == RPC_S_OK)
+        {
+            LogToFile(L"RPC: ALPC server LISTENING...");
+            status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, FALSE);
+            wsprintf(buf, L"RPC: Listen returned=%d", (int)status);
+            LogToFile(buf);
+        }
+    }
+
+    LogToFile(L"RPC: Server stopped - signaling service");
+    if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
+    return 0;
+}
+
 VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv);
 VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode);
 DWORD WINAPI ServiceWorkerThread(LPVOID lp);
@@ -42,14 +104,19 @@ void StopAllApps();
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR c, int n)
 {
+    (void)h; (void)hp; (void)c; (void)n;
     LogToFile(L"WinMain: Starting dispatcher");
+
     SERVICE_TABLE_ENTRY st[] = {
         { (LPWSTR)SERVICE_NAME, (LPSERVICE_MAIN_FUNCTION)ServiceMain },
         { NULL, NULL }
     };
+
     if (!StartServiceCtrlDispatcher(st))
     {
-        LogToFile((L"ERROR: Dispatcher=" + std::to_wstring(GetLastError())).c_str());
+        wchar_t buf[100];
+        wsprintf(buf, L"ERROR: Dispatcher=%d", (int)GetLastError());
+        LogToFile(buf);
         return GetLastError();
     }
     return 0;
@@ -57,6 +124,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR c, int n)
 
 VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
 {
+    (void)argc; (void)argv;
     LogToFile(L"ServiceMain: START");
 
     g_StatusHandle = RegisterServiceCtrlHandler(SERVICE_NAME, ServiceCtrlHandler);
@@ -65,6 +133,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
     ZeroMemory(&g_ServiceStatus, sizeof(g_ServiceStatus));
     g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
+    g_ServiceStatus.dwControlsAccepted = 0;
     g_ServiceStatus.dwWin32ExitCode = NO_ERROR;
     g_ServiceStatus.dwCheckPoint = 1;
     g_ServiceStatus.dwWaitHint = 10000;
@@ -78,19 +147,23 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
         return;
     }
 
+    // Start RPC server
+    HANDLE hRpc = CreateThread(NULL, 0, RpcServerThread, NULL, 0, NULL);
+    LogToFile(L"ServiceMain: RPC thread created");
+
     // Start worker thread
     HANDLE hWorker = CreateThread(NULL, 0, ServiceWorkerThread, NULL, 0, NULL);
     LogToFile(L"ServiceMain: Worker thread created");
 
     // Set RUNNING
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
-    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+    g_ServiceStatus.dwControlsAccepted = 0;
     g_ServiceStatus.dwCheckPoint = 0;
     g_ServiceStatus.dwWaitHint = 0;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
     LogToFile(L"ServiceMain: RUNNING");
 
-    // Wait for stop
+    // Wait for stop signal
     WaitForSingleObject(g_ServiceStopEvent, INFINITE);
     LogToFile(L"ServiceMain: Stop signal received");
 
@@ -100,6 +173,9 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
 
     StopAllApps();
 
+    RpcMgmtStopServerListening(NULL);
+
+    if (hRpc) { WaitForSingleObject(hRpc, 5000); CloseHandle(hRpc); }
     if (hWorker) { WaitForSingleObject(hWorker, 5000); CloseHandle(hWorker); }
 
     CloseHandle(g_ServiceStopEvent);
@@ -111,15 +187,14 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
 
 VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode)
 {
+    wchar_t buf[100];
+    wsprintf(buf, L"CtrlHandler: code=%d (IGNORED)", (int)CtrlCode);
+
     switch (CtrlCode)
     {
     case SERVICE_CONTROL_STOP:
-        g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
-        SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
-        if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
-        break;
     case SERVICE_CONTROL_SHUTDOWN:
-        // IGNORED
+        LogToFile(buf);
         break;
     case SERVICE_CONTROL_INTERROGATE:
         SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
@@ -129,6 +204,7 @@ VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode)
 
 DWORD WINAPI ServiceWorkerThread(LPVOID lp)
 {
+    (void)lp;
     LogToFile(L"Worker: STARTED");
 
     std::set<DWORD> known;
@@ -137,7 +213,10 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
 
     if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &p, &n))
     {
-        LogToFile((L"Worker: Found " + std::to_wstring(n) + L" sessions").c_str());
+        wchar_t buf[100];
+        wsprintf(buf, L"Worker: Found %d sessions", (int)n);
+        LogToFile(buf);
+
         for (DWORD i = 0; i < n; i++)
         {
             if (p[i].SessionId != 0)
@@ -152,7 +231,6 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
         WTSFreeMemory(p);
     }
 
-    // Monitor for new sessions
     while (WaitForSingleObject(g_ServiceStopEvent, 3000) == WAIT_TIMEOUT)
     {
         WTS_SESSION_INFO* ps = NULL;
@@ -180,19 +258,12 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
 
 void StartAppInSession(DWORD sessionId)
 {
-    LogToFile((L"StartApp: session " + std::to_wstring(sessionId)).c_str());
-
     HANDLE hToken = NULL;
-    if (!WTSQueryUserToken(sessionId, &hToken))
-    {
-        LogToFile((L"StartApp: Token error=" + std::to_wstring(GetLastError())).c_str());
-        return;
-    }
+    if (!WTSQueryUserToken(sessionId, &hToken)) return;
 
     HANDLE hDup = NULL;
     if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup))
     {
-        LogToFile((L"StartApp: DupToken error=" + std::to_wstring(GetLastError())).c_str());
         CloseHandle(hToken);
         return;
     }
@@ -204,10 +275,8 @@ void StartAppInSession(DWORD sessionId)
     size_t pos = app.rfind(L"\\");
     if (pos != std::wstring::npos) app = app.substr(0, pos + 1) + L"TrayApp.exe";
 
-    LogToFile((L"StartApp: Launching " + app).c_str());
-
     STARTUPINFO si = { sizeof(si) };
-    si.lpDesktop = (LPWSTR)L"winsta0\\default";
+    si.lpDesktop = NULL;
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
@@ -223,10 +292,6 @@ void StartAppInSession(DWORD sessionId)
         g_SessionProcesses[sessionId].push_back(pi.hProcess);
         CloseHandle(pi.hThread);
     }
-    else
-    {
-        LogToFile((L"StartApp: FAILED error=" + std::to_wstring(GetLastError())).c_str());
-    }
 
     if (env) DestroyEnvironmentBlock(env);
     CloseHandle(hDup);
@@ -234,15 +299,12 @@ void StartAppInSession(DWORD sessionId)
 
 void StopAllApps()
 {
-    LogToFile(L"StopAllApps: Terminating processes");
     std::lock_guard<std::mutex> lock(g_ProcessMutex);
     for (auto& pair : g_SessionProcesses)
-    {
         for (HANDLE h : pair.second)
         {
             TerminateProcess(h, 0);
             CloseHandle(h);
         }
-    }
     g_SessionProcesses.clear();
 }
