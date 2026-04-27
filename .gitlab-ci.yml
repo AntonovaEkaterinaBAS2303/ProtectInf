@@ -1,18 +1,41 @@
 stages:
   - build
 
+# ============================================
+# Сборка Windows приложения
+# ============================================
 build-trayapp:
   stage: build
   tags:
     - windows
-    - saas-windows-medium-amd64
   script:
-    - echo "Building TrayApp..."
-    - cmake -B out/build/x64-release -G "Visual Studio 17 2022" -A x64
-    - cmake --build out/build/x64-release --config Release
-    - dir out\build\x64-release\bin\Release\
+    - echo "=== Building TrayApp Windows Service ==="
+    - echo ""
+    - echo "[1/2] Configuring CMake for x64 Release..."
+    - cmake -B out/build/x64-release -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+    - if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    - echo ""
+    - echo "[2/2] Building project..."
+    - cmake --build out/build/x64-release --config Release --parallel
+    - if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    - echo ""
+    - echo "=== Build Complete! ==="
+    - echo "Artifacts:"
+    - dir out\build\x64-release\bin\Release\*.exe
+    - echo ""
+    - echo "TrayService.exe:"
+    - dir out\build\x64-release\bin\Release\TrayService.exe
+    - echo ""
+    - echo "TrayApp.exe:"
+    - dir out\build\x64-release\bin\Release\TrayApp.exe
   artifacts:
+    name: "TrayApp-${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
     paths:
       - out/build/x64-release/bin/Release/TrayService.exe
       - out/build/x64-release/bin/Release/TrayApp.exe
     expire_in: 30 days
+  only:
+    - main
+    - master
+    - merge_requests
+    - feature/windows-service-rpc
