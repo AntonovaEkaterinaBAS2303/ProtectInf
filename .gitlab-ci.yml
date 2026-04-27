@@ -3,11 +3,13 @@ stages:
 
 build-trayapp:
   stage: build
+  tags:
+    - windows
+    - saas-windows-medium-amd64
   script:
-    - echo "=== Building TrayApp Windows Service ==="
-    - cmake -B out/build/x64-release -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+    - echo "Building TrayApp..."
+    - cmake -B out/build/x64-release -G "Visual Studio 17 2022" -A x64
     - cmake --build out/build/x64-release --config Release
-    - echo "=== Build Complete ==="
     - dir out\build\x64-release\bin\Release\
   artifacts:
     paths:
