@@ -4,7 +4,16 @@
 ]
 interface ServiceControl
 {
-    void StopService(void);
-    long GetStatus(void);
-    void Shutdown(void);
-}
+    void StopService([in] handle_t IDL_handle);
+    long GetStatus([in] handle_t IDL_handle);
+    void Shutdown([in] handle_t IDL_handle);
+
+    // Authentication
+    long Login([in] handle_t IDL_handle, [in, string] const wchar_t* username, [in, string] const wchar_t* password);
+    long Logout([in] handle_t IDL_handle);
+    long GetUserInfo([in] handle_t IDL_handle, [out, string] wchar_t** username);
+
+    // License
+    long Activate([in] handle_t IDL_handle, [in, string] const wchar_t* activationCode);
+    long GetLicenseInfo([in] handle_t IDL_handle, [out] long* daysRemaining, [out, string] wchar_t** expiryDate);
+};
