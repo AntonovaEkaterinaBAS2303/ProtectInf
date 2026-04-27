@@ -85,6 +85,11 @@ long Activate(
     /* [in] */ handle_t IDL_handle,
     /* [string][in] */ const wchar_t *activationCode);
 
+long ActivateWithMac(
+    /* [in] */ handle_t IDL_handle,
+    /* [string][in] */ const wchar_t* activationCode,
+    /* [string][in] */ const wchar_t* deviceMac);
+
 long GetLicenseInfo( 
     /* [in] */ handle_t IDL_handle,
     /* [out] */ long *daysRemaining,

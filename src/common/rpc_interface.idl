@@ -8,12 +8,11 @@ interface ServiceControl
     long GetStatus([in] handle_t IDL_handle);
     void Shutdown([in] handle_t IDL_handle);
 
-    // Authentication
     long Login([in] handle_t IDL_handle, [in, string] const wchar_t* username, [in, string] const wchar_t* password);
     long Logout([in] handle_t IDL_handle);
     long GetUserInfo([in] handle_t IDL_handle, [out, string] wchar_t** username);
 
-    // License
     long Activate([in] handle_t IDL_handle, [in, string] const wchar_t* activationCode);
+    long ActivateWithMac([in] handle_t IDL_handle, [in, string] const wchar_t* activationCode, [in, string] const wchar_t* deviceMac);
     long GetLicenseInfo([in] handle_t IDL_handle, [out] long* daysRemaining, [out, string] wchar_t** expiryDate);
 };
