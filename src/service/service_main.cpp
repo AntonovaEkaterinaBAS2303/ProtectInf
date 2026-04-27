@@ -3,6 +3,7 @@
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <rpc.h>
+#include <iphlpapi.h>
 #include <fstream>
 #include <string>
 #include <map>
@@ -19,6 +20,7 @@
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 #include "service_rpc.h"
 
@@ -34,9 +36,14 @@ extern "C" {
 
 #define SERVICE_NAME L"TrayAppService"
 
+// ==================== КОНФИГУРАЦИЯ СЕРВЕРА ====================
 #define API_HOST L"localhost"
 #define API_PORT 8443
-#define API_USE_HTTPS true  
+#define API_USE_HTTPS true
+// =============================================================
+
+// ID продукта (должен совпадать с БД)
+#define PRODUCT_ID L"123e4567-e89b-12d3-a456-426614174000"
 
 void LogToFile(const wchar_t* msg)
 {
@@ -89,6 +96,7 @@ bool ActivateLicense(const std::wstring& activationCode);
 DWORD WINAPI TokenRefreshThread(LPVOID lp);
 DWORD WINAPI LicenseRefreshThread(LPVOID lp);
 void StartRefreshThreads();
+std::wstring GetDeviceMac();
 
 // RPC Interface Implementation
 void StopService(handle_t h)
@@ -118,15 +126,13 @@ std::wstring ExtractJsonValue(const std::wstring& json, const std::wstring& key)
         start = json.find(search);
         if (start == std::wstring::npos) return L"";
         start += search.length();
-        // Проверяем, не число ли это или boolean
         size_t end = json.find(L",", start);
         size_t endBrace = json.find(L"}", start);
         if (end == std::wstring::npos) end = endBrace;
         if (endBrace != std::wstring::npos && endBrace < end) end = endBrace;
         std::wstring val = json.substr(start, end - start);
-        // Убираем пробелы и кавычки
-        while (!val.empty() && (val[0] == L' ' || val[0] == L'"')) val = val.substr(1);
-        while (!val.empty() && (val.back() == L' ' || val.back() == L'"')) val.pop_back();
+        while (!val.empty() && val[0] == L' ') val = val.substr(1);
+        while (!val.empty() && val.back() == L' ') val.pop_back();
         return val;
     }
     start += search.length();
@@ -143,6 +149,28 @@ long long ExtractJsonInt(const std::wstring& json, const std::wstring& key) {
     catch (...) {
         return 0;
     }
+}
+
+// Получение MAC-адреса
+std::wstring GetDeviceMac() {
+    IP_ADAPTER_INFO adapterInfo[16];
+    DWORD bufLen = sizeof(adapterInfo);
+    DWORD status = GetAdaptersInfo(adapterInfo, &bufLen);
+
+    if (status == ERROR_SUCCESS) {
+        PIP_ADAPTER_INFO adapter = adapterInfo;
+        while (adapter) {
+            if (adapter->AddressLength == 6) {
+                wchar_t mac[18];
+                wsprintf(mac, L"%02X-%02X-%02X-%02X-%02X-%02X",
+                    adapter->Address[0], adapter->Address[1], adapter->Address[2],
+                    adapter->Address[3], adapter->Address[4], adapter->Address[5]);
+                return std::wstring(mac);
+            }
+            adapter = adapter->Next;
+        }
+    }
+    return L"00-00-00-00-00-00";
 }
 
 // HTTP/HTTPS клиент
@@ -188,7 +216,7 @@ public:
 
         if (!hRequest) return false;
 
-        // Для HTTPS может потребоваться игнорировать ошибки сертификата при тестировании
+        // Игнорировать ошибки сертификата для тестирования
         if (useHttps) {
             DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                 SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
@@ -226,7 +254,6 @@ public:
             std::vector<char> buffer(size + 1);
             if (!WinHttpReadData(hRequest, buffer.data(), size, &downloaded)) break;
 
-            // Конвертируем UTF-8 ответ в wstring
             int wideLen = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), downloaded, NULL, 0);
             std::vector<wchar_t> wideBuf(wideLen + 1);
             MultiByteToWideChar(CP_UTF8, 0, buffer.data(), downloaded, wideBuf.data(), wideLen);
@@ -258,6 +285,10 @@ bool PerformLogin(const std::wstring& username, const std::wstring& password) {
 
     std::wstring body = L"{\"username\":\"" + username + L"\",\"password\":\"" + password + L"\",\"deviceId\":\"trayapp-windows\"}";
 
+    wchar_t buf[512];
+    wsprintf(buf, L"HTTP: Sending login request for user: %s", username.c_str());
+    LogToFile(buf);
+
     if (!client.SendRequest(L"POST", L"/auth/login", body)) {
         LogToFile(L"HTTP: Login request failed");
         return false;
@@ -265,6 +296,9 @@ bool PerformLogin(const std::wstring& username, const std::wstring& password) {
 
     DWORD statusCode = client.GetStatusCode();
     std::wstring response = client.GetResponse();
+
+    wsprintf(buf, L"HTTP: Login response code=%d", (int)statusCode);
+    LogToFile(buf);
 
     if (statusCode != 200) return false;
 
@@ -274,10 +308,10 @@ bool PerformLogin(const std::wstring& username, const std::wstring& password) {
     g_AuthTokens->refreshToken = ExtractJsonValue(response, L"refreshToken");
     g_AuthenticatedUser = username;
 
-    // Жёстко задаём время жизни токенов
+    // Жёстко задаём время жизни (24 часа access, 30 дней refresh)
     auto now = std::chrono::system_clock::now();
-    g_AuthTokens->accessExpiry = now + std::chrono::hours(1);   // 1 час
-    g_AuthTokens->refreshExpiry = now + std::chrono::hours(720); // 30 дней
+    g_AuthTokens->accessExpiry = now + std::chrono::hours(24);
+    g_AuthTokens->refreshExpiry = now + std::chrono::hours(720);
 
     LogToFile(L"HTTP: Login successful");
     return true;
@@ -305,12 +339,9 @@ bool RefreshTokens() {
     g_AuthTokens->accessToken = ExtractJsonValue(response, L"accessToken");
     g_AuthTokens->refreshToken = ExtractJsonValue(response, L"refreshToken");
 
-    long long accessExp = ExtractJsonInt(response, L"accessTokenExpiresIn");
-    long long refreshExp = ExtractJsonInt(response, L"refreshTokenExpiresIn");
-
     auto now = std::chrono::system_clock::now();
-    g_AuthTokens->accessExpiry = now + std::chrono::seconds(accessExp > 0 ? accessExp : 3600);
-    g_AuthTokens->refreshExpiry = now + std::chrono::seconds(refreshExp > 0 ? refreshExp : 86400);
+    g_AuthTokens->accessExpiry = now + std::chrono::hours(24);
+    g_AuthTokens->refreshExpiry = now + std::chrono::hours(720);
 
     LogToFile(L"HTTP: Tokens refreshed");
     return true;
@@ -325,11 +356,13 @@ bool RequestLicenseStatus() {
         accessToken = g_AuthTokens->accessToken;
     }
 
+    std::wstring deviceMac = GetDeviceMac();
+
     HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
     if (!client.Connect()) return false;
 
-    // LicenseCheckRequest - предполагаем что нужен пустой body или token
-    std::wstring body = L"{}";
+    // licenseCheckRequest с deviceMac и productId
+    std::wstring body = L"{\"deviceMac\":\"" + deviceMac + L"\",\"productId\":\"" + PRODUCT_ID + L"\"}";
 
     if (!client.SendRequest(L"POST", L"/api/license/check", body, accessToken)) {
         LogToFile(L"HTTP: License status request failed");
@@ -345,16 +378,39 @@ bool RequestLicenseStatus() {
 
     if (statusCode != 200) return false;
 
+    // TicketResponse содержит licenseCode, expirationDate, status
     std::lock_guard<std::mutex> licenseLock(g_LicenseMutex);
     g_LicenseInfo = std::make_unique<LicenseInfo>();
-    g_LicenseInfo->ticket = ExtractJsonValue(response, L"ticket");
-    g_LicenseInfo->active = (ExtractJsonValue(response, L"status") == L"ACTIVE" ||
-        ExtractJsonValue(response, L"status") == L"active");
+    g_LicenseInfo->ticket = ExtractJsonValue(response, L"licenseCode");
 
-    long long expiry = ExtractJsonInt(response, L"expiresAt");
-    if (expiry == 0) expiry = ExtractJsonInt(response, L"expires_at");
-    if (expiry > 0) {
-        g_LicenseInfo->expiryDate = std::chrono::system_clock::from_time_t((time_t)expiry);
+    std::wstring status = ExtractJsonValue(response, L"status");
+    g_LicenseInfo->active = (status == L"ACTIVE");
+
+    if (!g_LicenseInfo->active) {
+        // Проверяем blocked
+        std::wstring blocked = ExtractJsonValue(response, L"blocked");
+        if (blocked == L"true") g_LicenseInfo->active = false;
+    }
+
+    // Парсим expirationDate
+    std::wstring expDate = ExtractJsonValue(response, L"expirationDate");
+    if (!expDate.empty() && expDate != L"null") {
+        // Формат ISO: 2027-04-12T00:00:00
+        struct tm stm = {};
+        int year, month, day;
+        if (swscanf_s(expDate.c_str(), L"%d-%d-%d", &year, &month, &day) == 3) {
+            stm.tm_year = year - 1900;
+            stm.tm_mon = month - 1;
+            stm.tm_mday = day;
+            stm.tm_hour = 0;
+            stm.tm_min = 0;
+            stm.tm_sec = 0;
+            time_t t = _mkgmtime(&stm);
+            g_LicenseInfo->expiryDate = std::chrono::system_clock::from_time_t(t);
+        }
+        else {
+            g_LicenseInfo->expiryDate = std::chrono::system_clock::now() + std::chrono::hours(8760);
+        }
     }
     else {
         g_LicenseInfo->expiryDate = std::chrono::system_clock::now() + std::chrono::hours(8760);
@@ -371,13 +427,17 @@ bool ActivateLicense(const std::wstring& activationCode) {
         accessToken = g_AuthTokens->accessToken;
     }
 
+    std::wstring deviceMac = GetDeviceMac();
+    std::wstring deviceName = L"TrayApp-Windows";
+
     HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
     if (!client.Connect()) return false;
 
-    std::wstring body = L"{\"activationCode\":\"" + activationCode + L"\"}";
+    // LicenseActivateRequest с activationKey, deviceMac, deviceName
+    std::wstring body = L"{\"activationKey\":\"" + activationCode + L"\",\"deviceMac\":\"" + deviceMac + L"\",\"deviceName\":\"" + deviceName + L"\"}";
 
-    wchar_t buf[256];
-    wsprintf(buf, L"HTTP: Activating license with code: %s", activationCode.c_str());
+    wchar_t buf[512];
+    wsprintf(buf, L"HTTP: Activating license with key: %s, mac: %s", activationCode.c_str(), deviceMac.c_str());
     LogToFile(buf);
 
     if (!client.SendRequest(L"POST", L"/api/license/activate", body, accessToken)) {
@@ -388,32 +448,13 @@ bool ActivateLicense(const std::wstring& activationCode) {
     DWORD statusCode = client.GetStatusCode();
     std::wstring response = client.GetResponse();
 
-    wsprintf(buf, L"HTTP: Activation response code=%d", (int)statusCode);
+    wsprintf(buf, L"HTTP: Activation response code=%d, body=%s", (int)statusCode, response.c_str());
     LogToFile(buf);
 
     if (statusCode != 200) return false;
 
-    std::wstring ticket = ExtractJsonValue(response, L"ticket");
-
-    if (!ticket.empty()) {
-        std::lock_guard<std::mutex> licenseLock(g_LicenseMutex);
-        g_LicenseInfo = std::make_unique<LicenseInfo>();
-        g_LicenseInfo->ticket = ticket;
-        g_LicenseInfo->active = true;
-        long long expiry = ExtractJsonInt(response, L"expiresAt");
-        if (expiry == 0) expiry = ExtractJsonInt(response, L"expires_at");
-        if (expiry > 0) {
-            g_LicenseInfo->expiryDate = std::chrono::system_clock::from_time_t((time_t)expiry);
-        }
-        else {
-            g_LicenseInfo->expiryDate = std::chrono::system_clock::now() + std::chrono::hours(8760);
-        }
-        LogToFile(L"HTTP: License activated");
-        return true;
-    }
-
-    // Если тикет не вернулся, запрашиваем статус
-    LogToFile(L"HTTP: No ticket in response, checking status...");
+    // После успешной активации запрашиваем статус лицензии
+    LogToFile(L"HTTP: Activation successful, checking license status...");
     return RequestLicenseStatus();
 }
 
@@ -489,7 +530,7 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
 DWORD WINAPI TokenRefreshThread(LPVOID lp) {
     (void)lp;
     while (!g_bStopRefreshThreads) {
-        Sleep(30000);
+        Sleep(60000); // Проверка каждую минуту
 
         bool needRefresh = false;
         {
@@ -497,7 +538,8 @@ DWORD WINAPI TokenRefreshThread(LPVOID lp) {
             if (!g_AuthTokens) continue;
 
             auto now = std::chrono::system_clock::now();
-            if (now >= g_AuthTokens->accessExpiry - std::chrono::seconds(300)) {
+            // Обновляем за 5 минут до истечения
+            if (now >= g_AuthTokens->accessExpiry - std::chrono::minutes(5)) {
                 needRefresh = true;
             }
         }
@@ -511,7 +553,7 @@ DWORD WINAPI TokenRefreshThread(LPVOID lp) {
 DWORD WINAPI LicenseRefreshThread(LPVOID lp) {
     (void)lp;
     while (!g_bStopRefreshThreads) {
-        Sleep(3600000);
+        Sleep(3600000); // Проверка раз в час
 
         bool needRefresh = false;
         {
