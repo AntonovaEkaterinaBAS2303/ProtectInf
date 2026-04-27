@@ -34,6 +34,10 @@ extern "C" {
 
 #define SERVICE_NAME L"TrayAppService"
 
+#define API_HOST L"localhost"
+#define API_PORT 8443
+#define API_USE_HTTPS true  
+
 void LogToFile(const wchar_t* msg)
 {
     std::wofstream log;
@@ -114,9 +118,16 @@ std::wstring ExtractJsonValue(const std::wstring& json, const std::wstring& key)
         start = json.find(search);
         if (start == std::wstring::npos) return L"";
         start += search.length();
+        // Проверяем, не число ли это или boolean
         size_t end = json.find(L",", start);
-        if (end == std::wstring::npos) end = json.find(L"}", start);
-        return json.substr(start, end - start);
+        size_t endBrace = json.find(L"}", start);
+        if (end == std::wstring::npos) end = endBrace;
+        if (endBrace != std::wstring::npos && endBrace < end) end = endBrace;
+        std::wstring val = json.substr(start, end - start);
+        // Убираем пробелы и кавычки
+        while (!val.empty() && (val[0] == L' ' || val[0] == L'"')) val = val.substr(1);
+        while (!val.empty() && (val.back() == L' ' || val.back() == L'"')) val.pop_back();
+        return val;
     }
     start += search.length();
     size_t end = json.find(L"\"", start);
@@ -134,55 +145,68 @@ long long ExtractJsonInt(const std::wstring& json, const std::wstring& key) {
     }
 }
 
-// HTTPS клиент
-class HttpsClient {
+// HTTP/HTTPS клиент
+class HttpClient {
 private:
     HINTERNET hSession;
     HINTERNET hConnect;
     HINTERNET hRequest;
     std::wstring host;
     int port;
+    bool useHttps;
 
 public:
-    HttpsClient(const std::wstring& server, int port = 443)
-        : hSession(NULL), hConnect(NULL), hRequest(NULL), host(server), port(port) {
+    HttpClient(const std::wstring& server, int port = 8080, bool https = false)
+        : hSession(NULL), hConnect(NULL), hRequest(NULL), host(server), port(port), useHttps(https) {
         hSession = WinHttpOpen(L"TrayApp/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME,
             WINHTTP_NO_PROXY_BYPASS, 0);
     }
 
-    ~HttpsClient() {
+    ~HttpClient() {
         if (hRequest) WinHttpCloseHandle(hRequest);
         if (hConnect) WinHttpCloseHandle(hConnect);
         if (hSession) WinHttpCloseHandle(hSession);
     }
 
     bool Connect() {
-        hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+        hConnect = WinHttpConnect(hSession, host.c_str(), (INTERNET_PORT)port, 0);
         return hConnect != NULL;
     }
 
     bool SendRequest(const std::wstring& method, const std::wstring& path,
         const std::wstring& body = L"",
         const std::wstring& authHeader = L"") {
+
+        DWORD flags = useHttps ? WINHTTP_FLAG_SECURE : 0;
+
         hRequest = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(),
             NULL, WINHTTP_NO_REFERER,
             WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
+            flags);
 
         if (!hRequest) return false;
+
+        // Для HTTPS может потребоваться игнорировать ошибки сертификата при тестировании
+        if (useHttps) {
+            DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
+                SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+        }
 
         std::wstring headers = L"Content-Type: application/json\r\n";
         if (!authHeader.empty()) {
             headers += L"Authorization: Bearer " + authHeader + L"\r\n";
         }
 
+        LPCWSTR bodyPtr = body.empty() ? WINHTTP_NO_REQUEST_DATA : body.c_str();
         DWORD bodyLength = body.empty() ? 0 : (DWORD)(body.length() * sizeof(wchar_t));
 
         if (!WinHttpSendRequest(hRequest, headers.c_str(), -1,
-            body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
-            bodyLength, bodyLength, 0)) {
+            (LPVOID)bodyPtr, bodyLength, bodyLength, 0)) {
             return false;
         }
 
@@ -199,9 +223,15 @@ public:
             if (!WinHttpQueryDataAvailable(hRequest, &size)) break;
             if (size == 0) break;
 
-            std::vector<wchar_t> buffer(size + 1);
+            std::vector<char> buffer(size + 1);
             if (!WinHttpReadData(hRequest, buffer.data(), size, &downloaded)) break;
-            response.append(buffer.data(), downloaded);
+
+            // Конвертируем UTF-8 ответ в wstring
+            int wideLen = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), downloaded, NULL, 0);
+            std::vector<wchar_t> wideBuf(wideLen + 1);
+            MultiByteToWideChar(CP_UTF8, 0, buffer.data(), downloaded, wideBuf.data(), wideLen);
+            wideBuf[wideLen] = L'\0';
+            response.append(wideBuf.data());
         } while (size > 0);
 
         return response;
@@ -219,17 +249,17 @@ public:
 
 // Аутентификация
 bool PerformLogin(const std::wstring& username, const std::wstring& password) {
-    HttpsClient client(L"api.antivirus.example.com");
+    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
 
     if (!client.Connect()) {
-        LogToFile(L"HTTPS: Connection failed");
+        LogToFile(L"HTTP: Connection failed");
         return false;
     }
 
-    std::wstring body = L"{\"username\":\"" + username + L"\",\"password\":\"" + password + L"\"}";
+    std::wstring body = L"{\"username\":\"" + username + L"\",\"password\":\"" + password + L"\",\"deviceId\":\"trayapp-windows\"}";
 
-    if (!client.SendRequest(L"POST", L"/api/auth/login", body)) {
-        LogToFile(L"HTTPS: Login request failed");
+    if (!client.SendRequest(L"POST", L"/auth/login", body)) {
+        LogToFile(L"HTTP: Login request failed");
         return false;
     }
 
@@ -240,17 +270,16 @@ bool PerformLogin(const std::wstring& username, const std::wstring& password) {
 
     std::lock_guard<std::mutex> lock(g_AuthMutex);
     g_AuthTokens = std::make_unique<AuthTokens>();
-    g_AuthTokens->accessToken = ExtractJsonValue(response, L"access_token");
-    g_AuthTokens->refreshToken = ExtractJsonValue(response, L"refresh_token");
+    g_AuthTokens->accessToken = ExtractJsonValue(response, L"accessToken");
+    g_AuthTokens->refreshToken = ExtractJsonValue(response, L"refreshToken");
     g_AuthenticatedUser = username;
 
-    long long accessExp = ExtractJsonInt(response, L"access_expires_in");
-    long long refreshExp = ExtractJsonInt(response, L"refresh_expires_in");
-
+    // Жёстко задаём время жизни токенов
     auto now = std::chrono::system_clock::now();
-    g_AuthTokens->accessExpiry = now + std::chrono::seconds(accessExp > 0 ? accessExp : 3600);
-    g_AuthTokens->refreshExpiry = now + std::chrono::seconds(refreshExp > 0 ? refreshExp : 86400);
+    g_AuthTokens->accessExpiry = now + std::chrono::hours(1);   // 1 час
+    g_AuthTokens->refreshExpiry = now + std::chrono::hours(720); // 30 дней
 
+    LogToFile(L"HTTP: Login successful");
     return true;
 }
 
@@ -258,30 +287,32 @@ bool RefreshTokens() {
     std::lock_guard<std::mutex> lock(g_AuthMutex);
     if (!g_AuthTokens) return false;
 
-    HttpsClient client(L"api.antivirus.example.com");
+    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
     if (!client.Connect()) return false;
 
-    std::wstring body = L"{\"refresh_token\":\"" + g_AuthTokens->refreshToken + L"\"}";
+    std::wstring body = L"{\"refreshToken\":\"" + g_AuthTokens->refreshToken + L"\"}";
 
-    if (!client.SendRequest(L"POST", L"/api/auth/refresh", body)) return false;
+    if (!client.SendRequest(L"POST", L"/auth/refresh", body)) return false;
 
     if (client.GetStatusCode() != 200) {
+        LogToFile(L"HTTP: Token refresh failed");
         g_AuthTokens.reset();
         g_AuthenticatedUser.clear();
         return false;
     }
 
     std::wstring response = client.GetResponse();
-    g_AuthTokens->accessToken = ExtractJsonValue(response, L"access_token");
-    g_AuthTokens->refreshToken = ExtractJsonValue(response, L"refresh_token");
+    g_AuthTokens->accessToken = ExtractJsonValue(response, L"accessToken");
+    g_AuthTokens->refreshToken = ExtractJsonValue(response, L"refreshToken");
 
-    long long accessExp = ExtractJsonInt(response, L"access_expires_in");
-    long long refreshExp = ExtractJsonInt(response, L"refresh_expires_in");
+    long long accessExp = ExtractJsonInt(response, L"accessTokenExpiresIn");
+    long long refreshExp = ExtractJsonInt(response, L"refreshTokenExpiresIn");
 
     auto now = std::chrono::system_clock::now();
     g_AuthTokens->accessExpiry = now + std::chrono::seconds(accessExp > 0 ? accessExp : 3600);
     g_AuthTokens->refreshExpiry = now + std::chrono::seconds(refreshExp > 0 ? refreshExp : 86400);
 
+    LogToFile(L"HTTP: Tokens refreshed");
     return true;
 }
 
@@ -294,24 +325,34 @@ bool RequestLicenseStatus() {
         accessToken = g_AuthTokens->accessToken;
     }
 
-    HttpsClient client(L"api.antivirus.example.com");
+    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
     if (!client.Connect()) return false;
 
-    if (!client.SendRequest(L"GET", L"/api/license/check", L"", accessToken)) {
-        LogToFile(L"License status request failed");
+    // LicenseCheckRequest - предполагаем что нужен пустой body или token
+    std::wstring body = L"{}";
+
+    if (!client.SendRequest(L"POST", L"/api/license/check", body, accessToken)) {
+        LogToFile(L"HTTP: License status request failed");
         return false;
     }
 
-    if (client.GetStatusCode() != 200) return false;
-
+    DWORD statusCode = client.GetStatusCode();
     std::wstring response = client.GetResponse();
+
+    wchar_t buf[256];
+    wsprintf(buf, L"HTTP: License check response code=%d", (int)statusCode);
+    LogToFile(buf);
+
+    if (statusCode != 200) return false;
 
     std::lock_guard<std::mutex> licenseLock(g_LicenseMutex);
     g_LicenseInfo = std::make_unique<LicenseInfo>();
     g_LicenseInfo->ticket = ExtractJsonValue(response, L"ticket");
-    g_LicenseInfo->active = (ExtractJsonValue(response, L"status") == L"active");
+    g_LicenseInfo->active = (ExtractJsonValue(response, L"status") == L"ACTIVE" ||
+        ExtractJsonValue(response, L"status") == L"active");
 
-    long long expiry = ExtractJsonInt(response, L"expires_at");
+    long long expiry = ExtractJsonInt(response, L"expiresAt");
+    if (expiry == 0) expiry = ExtractJsonInt(response, L"expires_at");
     if (expiry > 0) {
         g_LicenseInfo->expiryDate = std::chrono::system_clock::from_time_t((time_t)expiry);
     }
@@ -330,19 +371,28 @@ bool ActivateLicense(const std::wstring& activationCode) {
         accessToken = g_AuthTokens->accessToken;
     }
 
-    HttpsClient client(L"api.antivirus.example.com");
+    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
     if (!client.Connect()) return false;
 
-    std::wstring body = L"{\"activation_code\":\"" + activationCode + L"\"}";
+    std::wstring body = L"{\"activationCode\":\"" + activationCode + L"\"}";
+
+    wchar_t buf[256];
+    wsprintf(buf, L"HTTP: Activating license with code: %s", activationCode.c_str());
+    LogToFile(buf);
 
     if (!client.SendRequest(L"POST", L"/api/license/activate", body, accessToken)) {
-        LogToFile(L"Activation request failed");
+        LogToFile(L"HTTP: Activation request failed");
         return false;
     }
 
-    if (client.GetStatusCode() != 200) return false;
-
+    DWORD statusCode = client.GetStatusCode();
     std::wstring response = client.GetResponse();
+
+    wsprintf(buf, L"HTTP: Activation response code=%d", (int)statusCode);
+    LogToFile(buf);
+
+    if (statusCode != 200) return false;
+
     std::wstring ticket = ExtractJsonValue(response, L"ticket");
 
     if (!ticket.empty()) {
@@ -350,12 +400,20 @@ bool ActivateLicense(const std::wstring& activationCode) {
         g_LicenseInfo = std::make_unique<LicenseInfo>();
         g_LicenseInfo->ticket = ticket;
         g_LicenseInfo->active = true;
-        long long expiry = ExtractJsonInt(response, L"expires_at");
-        g_LicenseInfo->expiryDate = std::chrono::system_clock::from_time_t((time_t)expiry);
+        long long expiry = ExtractJsonInt(response, L"expiresAt");
+        if (expiry == 0) expiry = ExtractJsonInt(response, L"expires_at");
+        if (expiry > 0) {
+            g_LicenseInfo->expiryDate = std::chrono::system_clock::from_time_t((time_t)expiry);
+        }
+        else {
+            g_LicenseInfo->expiryDate = std::chrono::system_clock::now() + std::chrono::hours(8760);
+        }
+        LogToFile(L"HTTP: License activated");
         return true;
     }
 
     // Если тикет не вернулся, запрашиваем статус
+    LogToFile(L"HTTP: No ticket in response, checking status...");
     return RequestLicenseStatus();
 }
 

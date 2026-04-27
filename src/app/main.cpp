@@ -13,6 +13,7 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include "resource.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
