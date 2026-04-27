@@ -8,6 +8,7 @@
 #include <mutex>
 #include <vector>
 #include <set>
+#include <filesystem>
 
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
@@ -35,6 +36,7 @@ SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
 HANDLE g_ServiceStopEvent = NULL;
 std::map<DWORD, std::vector<HANDLE>> g_SessionProcesses;
 std::mutex g_ProcessMutex;
+std::wstring g_ServiceDirectory;
 
 // RPC Interface Implementation
 void StopService(handle_t h)
@@ -105,6 +107,16 @@ void StopAllApps();
 int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR c, int n)
 {
     (void)h; (void)hp; (void)c; (void)n;
+
+    // Set working directory to service executable directory
+    wchar_t modulePath[MAX_PATH];
+    GetModuleFileNameW(NULL, modulePath, MAX_PATH);
+    std::wstring filename(modulePath);
+    std::wstring directory = std::filesystem::path(filename).parent_path().wstring();
+    SetCurrentDirectoryW(directory.c_str());
+    g_ServiceDirectory = directory;
+
+    LogToFile((L"Service directory: " + directory).c_str());
     LogToFile(L"WinMain: Starting dispatcher");
 
     SERVICE_TABLE_ENTRY st[] = {
@@ -187,16 +199,19 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
 
 VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode)
 {
-    wchar_t buf[100];
-    wsprintf(buf, L"CtrlHandler: code=%d (IGNORED)", (int)CtrlCode);
-
+    // IGNORE ALL control signals except interrogate
     switch (CtrlCode)
     {
     case SERVICE_CONTROL_STOP:
+        LogToFile(L"CtrlHandler: STOP signal IGNORED");
+        break;
     case SERVICE_CONTROL_SHUTDOWN:
-        LogToFile(buf);
+        LogToFile(L"CtrlHandler: SHUTDOWN signal IGNORED");
         break;
     case SERVICE_CONTROL_INTERROGATE:
+        SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+        break;
+    default:
         SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
         break;
     }
@@ -222,6 +237,9 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
             if (p[i].SessionId != 0)
             {
                 known.insert(p[i].SessionId);
+                wsprintf(buf, L"Worker: Session %d state=%d", (int)p[i].SessionId, (int)p[i].State);
+                LogToFile(buf);
+
                 if (p[i].State == WTSActive || p[i].State == WTSConnected)
                 {
                     StartAppInSession(p[i].SessionId);
@@ -231,6 +249,8 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
         WTSFreeMemory(p);
     }
 
+    // Monitor for new sessions with detailed logging
+    LogToFile(L"Worker: Monitoring for new sessions...");
     while (WaitForSingleObject(g_ServiceStopEvent, 3000) == WAIT_TIMEOUT)
     {
         WTS_SESSION_INFO* ps = NULL;
@@ -239,8 +259,12 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
         {
             for (DWORD i = 0; i < ns; i++)
             {
-                if (ps[i].SessionId != 0 && known.find(ps[i].SessionId) == known.end())
+                if (known.find(ps[i].SessionId) == known.end())
                 {
+                    wchar_t buf[100];
+                    wsprintf(buf, L"Worker: NEW session %d state=%d", (int)ps[i].SessionId, (int)ps[i].State);
+                    LogToFile(buf);
+
                     known.insert(ps[i].SessionId);
                     if (ps[i].State == WTSActive || ps[i].State == WTSConnected)
                     {
@@ -259,21 +283,24 @@ DWORD WINAPI ServiceWorkerThread(LPVOID lp)
 void StartAppInSession(DWORD sessionId)
 {
     HANDLE hToken = NULL;
-    if (!WTSQueryUserToken(sessionId, &hToken)) return;
+    if (!WTSQueryUserToken(sessionId, &hToken))
+    {
+        LogToFile((L"StartApp: Token error=" + std::to_wstring(GetLastError())).c_str());
+        return;
+    }
 
     HANDLE hDup = NULL;
     if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup))
     {
+        LogToFile((L"StartApp: DupToken error=" + std::to_wstring(GetLastError())).c_str());
         CloseHandle(hToken);
         return;
     }
     CloseHandle(hToken);
 
-    WCHAR path[MAX_PATH];
-    GetModuleFileName(NULL, path, MAX_PATH);
-    std::wstring app = path;
-    size_t pos = app.rfind(L"\\");
-    if (pos != std::wstring::npos) app = app.substr(0, pos + 1) + L"TrayApp.exe";
+    // Launch TrayApp from service directory
+    std::wstring appPath = g_ServiceDirectory + L"\\TrayApp.exe --service";
+    LogToFile((L"StartApp: Launching " + appPath).c_str());
 
     STARTUPINFO si = { sizeof(si) };
     si.lpDesktop = NULL;
@@ -284,13 +311,17 @@ void StartAppInSession(DWORD sessionId)
     LPVOID env = NULL;
     CreateEnvironmentBlock(&env, hDup, FALSE);
 
-    if (CreateProcessAsUser(hDup, NULL, (LPWSTR)app.c_str(), NULL, NULL, FALSE,
+    if (CreateProcessAsUser(hDup, NULL, (LPWSTR)appPath.c_str(), NULL, NULL, FALSE,
         CREATE_UNICODE_ENVIRONMENT, env, NULL, &si, &pi))
     {
         LogToFile((L"StartApp: SUCCESS PID=" + std::to_wstring(pi.dwProcessId)).c_str());
         std::lock_guard<std::mutex> lock(g_ProcessMutex);
         g_SessionProcesses[sessionId].push_back(pi.hProcess);
         CloseHandle(pi.hThread);
+    }
+    else
+    {
+        LogToFile((L"StartApp: CreateProcess failed=" + std::to_wstring(GetLastError())).c_str());
     }
 
     if (env) DestroyEnvironmentBlock(env);
@@ -299,6 +330,7 @@ void StartAppInSession(DWORD sessionId)
 
 void StopAllApps()
 {
+    LogToFile(L"StopAllApps: Terminating processes");
     std::lock_guard<std::mutex> lock(g_ProcessMutex);
     for (auto& pair : g_SessionProcesses)
         for (HANDLE h : pair.second)
