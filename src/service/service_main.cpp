@@ -540,36 +540,73 @@ VOID WINAPI ServiceCtrlHandler(DWORD c) {
 }
 
 DWORD WINAPI ServiceWorkerThread(LPVOID) {
-    std::set<DWORD> known; WTS_SESSION_INFO* p = NULL; DWORD n = 0;
+    LogToFile(L"ServiceWorkerThread: Started");
+
+    std::set<DWORD> known;
+    WTS_SESSION_INFO* p = NULL;
+    DWORD n = 0;
+
+    // Первый проход - запускаем в существующих активных сессиях
     if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &p, &n)) {
+        wchar_t buf[256];
+        wsprintf(buf, L"ServiceWorkerThread: Found %d sessions", n);
+        LogToFile(buf);
+
         for (DWORD i = 0; i < n; i++) {
-            // Явно пропускаем сессию 0 (системные службы)
-            if (p[i].SessionId == 0)
-                continue;
+            wsprintf(buf, L"ServiceWorkerThread: Session %d - ID=%d, State=%d",
+                i, p[i].SessionId, p[i].State);
+            LogToFile(buf);
+
+            if (p[i].SessionId == 0) continue;
+
             known.insert(p[i].SessionId);
-            if (p[i].State == WTSActive)
+
+            // Запускаем для активных И подключенных сессий
+            if (p[i].State == WTSActive || p[i].State == WTSConnected || p[i].State == WTSDisconnected) {
+                LogToFile(L"ServiceWorkerThread: Starting app in session");
                 StartAppInSession(p[i].SessionId);
+            }
         }
         WTSFreeMemory(p);
     }
-    while (WaitForSingleObject(g_ServiceStopEvent, 3000) == WAIT_TIMEOUT) {
+
+    LogToFile(L"ServiceWorkerThread: Entering monitoring loop");
+
+    while (WaitForSingleObject(g_ServiceStopEvent, 5000) == WAIT_TIMEOUT) {
         WTS_SESSION_INFO* ps = NULL;
         DWORD ns = 0;
+
         if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &ps, &ns)) {
             for (DWORD i = 0; i < ns; i++) {
-                // Явно пропускаем сессию 0
-                if (ps[i].SessionId == 0)
-                    continue;
+                if (ps[i].SessionId == 0) continue;
 
+                // Новая сессия
                 if (!known.count(ps[i].SessionId)) {
+                    wchar_t buf[256];
+                    wsprintf(buf, L"ServiceWorkerThread: NEW session! ID=%d, State=%d",
+                        ps[i].SessionId, ps[i].State);
+                    LogToFile(buf);
+
                     known.insert(ps[i].SessionId);
-                    if (ps[i].State == WTSActive)
+
+                    if (ps[i].State == WTSActive || ps[i].State == WTSConnected) {
+                        LogToFile(L"ServiceWorkerThread: Launching app in new session");
                         StartAppInSession(ps[i].SessionId);
+                    }
+                }
+                // Существующая сессия, но изменилось состояние
+                else if (ps[i].State == WTSActive && !g_SessionProcesses.count(ps[i].SessionId)) {
+                    wchar_t buf[256];
+                    wsprintf(buf, L"ServiceWorkerThread: Session %d became active, starting app", ps[i].SessionId);
+                    LogToFile(buf);
+                    StartAppInSession(ps[i].SessionId);
                 }
             }
             WTSFreeMemory(ps);
         }
     }
+
+    LogToFile(L"ServiceWorkerThread: Exiting");
     return 0;
 }
 
