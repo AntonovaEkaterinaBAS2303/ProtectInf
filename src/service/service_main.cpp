@@ -552,7 +552,24 @@ DWORD WINAPI ServiceWorkerThread(LPVOID) {
         }
         WTSFreeMemory(p);
     }
-    while (WaitForSingleObject(g_ServiceStopEvent, 3000) == WAIT_TIMEOUT) { WTS_SESSION_INFO* ps = NULL; DWORD ns = 0; if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &ps, &ns)) { for (DWORD i = 0;i < ns;i++) if (!known.count(ps[i].SessionId)) { known.insert(ps[i].SessionId); if (ps[i].State == WTSActive) StartAppInSession(ps[i].SessionId); } WTSFreeMemory(ps); } }
+    while (WaitForSingleObject(g_ServiceStopEvent, 3000) == WAIT_TIMEOUT) {
+        WTS_SESSION_INFO* ps = NULL;
+        DWORD ns = 0;
+        if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &ps, &ns)) {
+            for (DWORD i = 0; i < ns; i++) {
+                // явно пропускаем сессию 0
+                if (ps[i].SessionId == 0)
+                    continue;
+
+                if (!known.count(ps[i].SessionId)) {
+                    known.insert(ps[i].SessionId);
+                    if (ps[i].State == WTSActive)
+                        StartAppInSession(ps[i].SessionId);
+                }
+            }
+            WTSFreeMemory(ps);
+        }
+    }
     return 0;
 }
 

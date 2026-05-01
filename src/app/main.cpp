@@ -320,7 +320,6 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int) {
     g_hInstance = hi;
     InitCommonControls();
 
-    // Проверяем, запущены ли мы от сервиса
     LPWSTR* szArglist;
     int nArgs;
     bool bFromService = false;
@@ -338,51 +337,41 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int) {
     if (!bFromService) {
         if (!EnsureServiceRunning()) {
             StartServiceIfNeeded();
-            // Ждем, пока служба перейдет в состояние SERVICE_RUNNING
             for (int i = 0; i < 30; i++) {
                 Sleep(1000);
-                if (EnsureServiceRunning())
-                    break;
-            }
-            // Дополнительная проверка: если после ожидания служба не запущена — сообщаем об ошибке
-            if (!EnsureServiceRunning()) {
-                MessageBox(NULL, L"Failed to start service", L"Error", MB_ICONERROR);
+                if (EnsureServiceRunning()) break;
             }
         }
         return 0;
     }
 
-    // После получения bFromService:
-    //if (bFromService) {
-    //    // Дополнительная проверка: родительским процессом должна быть служба
-    //    DWORD parentPid = GetParentProcessId();
-    //    HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
-    //    if (hParent) {
-    //        wchar_t parentPath[MAX_PATH] = { 0 };
-    //        DWORD size = MAX_PATH;
-    //        if (QueryFullProcessImageNameW(hParent, 0, parentPath, &size)) {
-    //            std::wstring path(parentPath);
-    //            // Проверяем, что родитель — это TrayService.exe
-    //            if (path.find(L"TrayService.exe") == std::wstring::npos) {
-    //                // Родитель не является службой — завершаем работу
-    //                CloseHandle(hParent);
-    //                return 0;
-    //            }
-    //        }
-    //        CloseHandle(hParent);
-    //    }
-    //    else {
-    //        // Не удалось открыть родительский процесс — завершаем работу
-    //        return 0;
-    //    }
-    //}
-
-    if (!EnsureServiceRunning()) {
-        return 0; // Служба не работает - выходим
+    // Проверка родительского процесса
+    bool parentCheckPassed = false;
+    DWORD parentPid = GetParentProcessId();
+    HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+    if (hParent) {
+        wchar_t parentPath[MAX_PATH] = { 0 };
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(hParent, 0, parentPath, &size)) {
+            std::wstring path(parentPath);
+            if (path.find(L"TrayService.exe") != std::wstring::npos) {
+                parentCheckPassed = true;
+            }
+        }
+        CloseHandle(hParent);
     }
 
+    // Если не удалось открыть процесс ИЛИ проверка не пройдена
+    if (!parentCheckPassed) {
+        // Дополнительная проверка: служба должна работать
+        if (!EnsureServiceRunning()) {
+            return 0; // Служба не работает - выходим
+        }
+        // Если служба работает, но родителя проверить не удалось -
+        // всё равно продолжаем (мы с флагом --service)
+    }
 
-    // Запущены от сервиса — показываем UI
+    // Создание окна
     WNDCLASSEX wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc; wc.hInstance = hi;
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); wc.hCursor = LoadCursor(NULL, IDC_ARROW);
