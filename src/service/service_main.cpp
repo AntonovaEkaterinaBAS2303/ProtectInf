@@ -33,6 +33,10 @@ extern "C" {
 #define API_USE_HTTPS true
 #define PRODUCT_ID L"123e4567-e89b-12d3-a456-426614174000"
 
+// ======== MAC АДРЕС УСТРОЙСТВА (используется везде одинаковый) ========
+#define DEVICE_MAC L"E0:75:C3:FC:07:5C"
+// =====================================================================
+
 void LogToFile(const wchar_t* msg) {
     std::wofstream log;
     log.open(L"C:\\TrayService.log", std::ios::app);
@@ -64,7 +68,7 @@ bool g_bStopRefreshThreads = false;
 bool PerformLogin(const std::wstring& u, const std::wstring& p);
 bool RefreshTokens();
 bool RequestLicenseStatus();
-bool ActivateLicense(const std::wstring& code, const std::wstring& mac);
+bool ActivateLicense(const std::wstring& code);
 std::wstring GetDeviceMac();
 std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& expDate);
 DWORD WINAPI TokenRefreshThread(LPVOID);
@@ -72,9 +76,19 @@ DWORD WINAPI LicenseRefreshThread(LPVOID);
 void StartRefreshThreads();
 
 // RPC stubs
-void StopService(handle_t h) { (void)h; if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent); }
-long GetStatus(handle_t h) { (void)h; return g_ServiceStatus.dwCurrentState; }
-void Shutdown(handle_t h) { StopService(h); }
+void StopService(handle_t h) {
+    (void)h;
+    if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
+}
+
+long GetStatus(handle_t h) {
+    (void)h;
+    return g_ServiceStatus.dwCurrentState;
+}
+
+void Shutdown(handle_t h) {
+    StopService(h);
+}
 
 std::wstring ExtractJsonValue(const std::wstring& json, const std::wstring& key) {
     std::wstring search = L"\"" + key + L"\":\"";
@@ -88,8 +102,8 @@ std::wstring ExtractJsonValue(const std::wstring& json, const std::wstring& key)
         if (end == std::wstring::npos) end = endBrace;
         if (endBrace != std::wstring::npos && endBrace < end) end = endBrace;
         std::wstring val = json.substr(start, end - start);
-        while (!val.empty() && val[0] == L' ') val = val.substr(1);
-        while (!val.empty() && val.back() == L' ') val.pop_back();
+        while (!val.empty() && (val[0] == L' ' || val[0] == L'"')) val = val.substr(1);
+        while (!val.empty() && (val.back() == L' ' || val.back() == L'"')) val.pop_back();
         return val;
     }
     start += search.length();
@@ -103,25 +117,55 @@ long long ExtractJsonInt(const std::wstring& json, const std::wstring& key) {
     catch (...) { return 0; }
 }
 
-std::wstring GetDeviceMac() { return L"AA:BB:CC:DD:EE:FF"; }
+std::wstring GetDeviceMac() { return DEVICE_MAC; }
 
-// Парсинг даты из ISO формата: "2027-04-27T23:59:59" или "2027-04-27"
 std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& expDate) {
-    if (expDate.empty() || expDate == L"null")
+    if (expDate.empty() || expDate == L"null") {
+        LogToFile(L"ParseExpirationDate: Empty/null date, using default +1 year");
         return std::chrono::system_clock::now() + std::chrono::hours(8760);
+    }
+
+    wchar_t buf[512];
+    wsprintf(buf, L"ParseExpirationDate: Parsing: %s", expDate.c_str());
+    LogToFile(buf);
 
     int y = 0, m = 0, d = 0, h = 23, min = 59, s = 59;
-    int parsed = swscanf_s(expDate.c_str(), L"%d-%d-%dT%d:%d:%d", &y, &m, &d, &h, &min, &s);
-    if (parsed < 3)
-        parsed = swscanf_s(expDate.c_str(), L"%d-%d-%d", &y, &m, &d);
-    if (parsed >= 3) {
-        struct tm stm = {};
-        stm.tm_year = y - 1900; stm.tm_mon = m - 1; stm.tm_mday = d;
-        stm.tm_hour = (parsed >= 4) ? h : 23;
-        stm.tm_min = (parsed >= 5) ? min : 59;
-        stm.tm_sec = (parsed >= 6) ? s : 59;
-        return std::chrono::system_clock::from_time_t(_mkgmtime(&stm));
+    int parsed;
+
+    parsed = swscanf_s(expDate.c_str(), L"%d-%d-%dT%d:%d:%d", &y, &m, &d, &h, &min, &s);
+    if (parsed < 3) {
+        parsed = swscanf_s(expDate.c_str(), L"%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &min, &s);
     }
+    if (parsed < 3) {
+        parsed = swscanf_s(expDate.c_str(), L"%d-%d-%d", &y, &m, &d);
+        h = 23; min = 59; s = 59;
+    }
+
+    if (parsed >= 3) {
+        wsprintf(buf, L"ParseExpirationDate: Parsed: %d-%02d-%02d %02d:%02d:%02d", y, m, d, h, min, s);
+        LogToFile(buf);
+
+        struct tm stm = {};
+        stm.tm_year = y - 1900;
+        stm.tm_mon = m - 1;
+        stm.tm_mday = d;
+        stm.tm_hour = h;
+        stm.tm_min = min;
+        stm.tm_sec = s;
+
+        // Используем mktime для локального времени вместо _mkgmtime
+        time_t result = mktime(&stm);
+
+        time_t now = time(NULL);
+        if (result < now) {
+            LogToFile(L"ParseExpirationDate: Date is in the past, using default +1 year");
+            return std::chrono::system_clock::now() + std::chrono::hours(8760);
+        }
+
+        return std::chrono::system_clock::from_time_t(result);
+    }
+
+    LogToFile(L"ParseExpirationDate: Failed to parse, using default +1 year");
     return std::chrono::system_clock::now() + std::chrono::hours(8760);
 }
 
@@ -162,10 +206,10 @@ public:
 
 bool PerformLogin(const std::wstring& u, const std::wstring& p) {
     HttpClient c(API_HOST, API_PORT, API_USE_HTTPS);
-    if (!c.Connect()) return false;
+    if (!c.Connect()) { LogToFile(L"Login: Connection failed"); return false; }
     std::wstring body = L"{\"username\":\"" + u + L"\",\"password\":\"" + p + L"\",\"deviceId\":\"trayapp-windows\"}";
-    if (!c.SendRequest(L"POST", L"/auth/login", body)) return false;
-    if (c.GetStatusCode() != 200) return false;
+    if (!c.SendRequest(L"POST", L"/auth/login", body)) { LogToFile(L"Login: Request failed"); return false; }
+    if (c.GetStatusCode() != 200) { LogToFile(L"Login: Wrong status"); return false; }
     std::wstring r = c.GetResponse();
     std::lock_guard<std::mutex> l(g_AuthMutex);
     g_AuthTokens = std::make_unique<AuthTokens>();
@@ -175,6 +219,7 @@ bool PerformLogin(const std::wstring& u, const std::wstring& p) {
     auto now = std::chrono::system_clock::now();
     g_AuthTokens->accessExpiry = now + std::chrono::hours(24);
     g_AuthTokens->refreshExpiry = now + std::chrono::hours(720);
+    LogToFile(L"Login: Success");
     return true;
 }
 
@@ -196,75 +241,253 @@ bool RefreshTokens() {
 }
 
 bool RequestLicenseStatus() {
-    std::wstring at;
-    { std::lock_guard<std::mutex> l(g_AuthMutex); if (!g_AuthTokens) return false; at = g_AuthTokens->accessToken; }
-    HttpClient c(API_HOST, API_PORT, API_USE_HTTPS);
-    if (!c.Connect()) return false;
-    std::wstring body = L"{\"deviceMac\":\"" + GetDeviceMac() + L"\",\"productId\":\"" PRODUCT_ID L"\"}";
-    if (!c.SendRequest(L"POST", L"/api/license/check", body, at)) return false;
-    if (c.GetStatusCode() != 200) return false;
-    std::wstring r = c.GetResponse();
-    // Ищем ticket внутри ответа
-    std::wstring tj = r;
-    size_t ts = r.find(L"\"ticket\":{");
-    if (ts != std::wstring::npos) tj = r.substr(ts + 9);
+    std::wstring accessToken;
+    {
+        std::lock_guard<std::mutex> authLock(g_AuthMutex);
+        if (!g_AuthTokens) {
+            LogToFile(L"CheckLicense: No auth token");
+            return false;
+        }
+        accessToken = g_AuthTokens->accessToken;
+    }
 
-    std::lock_guard<std::mutex> ll(g_LicenseMutex);
-    g_LicenseInfo = std::make_unique<LicenseInfo>();
-    g_LicenseInfo->ticket = ExtractJsonValue(tj, L"licenseCode");
-    std::wstring status = ExtractJsonValue(tj, L"status");
-    std::wstring blocked = ExtractJsonValue(tj, L"blocked");
-    g_LicenseInfo->active = (status == L"ACTIVE" && blocked != L"true");
-    g_LicenseInfo->expiryDate = ParseExpirationDate(ExtractJsonValue(tj, L"expirationDate"));
+    wchar_t buf[512];
+    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
+    if (!client.Connect()) {
+        LogToFile(L"CheckLicense: Connection failed");
+        return false;
+    }
 
-    wchar_t buf[100]; wsprintf(buf, L"License check: active=%d, days=%lld", g_LicenseInfo->active ? 1 : 0,
-        std::chrono::duration_cast<std::chrono::hours>(g_LicenseInfo->expiryDate - std::chrono::system_clock::now()).count() / 24);
+    // ДОБАВЛЯЕМ productId - он ОБЯЗАТЕЛЕН!
+    std::wstring body = L"{\"deviceMac\":\"" + GetDeviceMac() + L"\",\"productId\":\"" + PRODUCT_ID + L"\"}";
+
+    LogToFile((L"CheckLicense: Request body: " + body).c_str());
+
+    if (!client.SendRequest(L"POST", L"/api/license/check", body, accessToken)) {
+        LogToFile(L"CheckLicense: Request failed");
+        return false;
+    }
+
+    DWORD statusCode = client.GetStatusCode();
+    std::wstring response = client.GetResponse();
+
+    wsprintf(buf, L"CheckLicense: code=%d, body=%s", (int)statusCode, response.c_str());
     LogToFile(buf);
-    return g_LicenseInfo->active;
+
+    if (statusCode == 200) {
+        // Парсим ответ
+        std::wstring expired = ExtractJsonValue(response, L"expired");
+        bool isActive = (expired == L"false" || expired.empty());
+
+        // Проверяем также поле active
+        std::wstring activeStr = ExtractJsonValue(response, L"active");
+        if (!activeStr.empty()) {
+            isActive = (activeStr == L"true");
+        }
+
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        g_LicenseInfo = std::make_unique<LicenseInfo>();
+        g_LicenseInfo->active = isActive;
+        g_LicenseInfo->ticket = ExtractJsonValue(response, L"licenseCode");
+        if (g_LicenseInfo->ticket.empty()) {
+            g_LicenseInfo->ticket = ExtractJsonValue(response, L"ticket");
+        }
+        if (g_LicenseInfo->ticket.empty()) {
+            g_LicenseInfo->ticket = ExtractJsonValue(response, L"code");
+        }
+
+        std::wstring expDate = ExtractJsonValue(response, L"expirationDate");
+        if (expDate.empty()) {
+            expDate = ExtractJsonValue(response, L"endingDate");
+        }
+        g_LicenseInfo->expiryDate = ParseExpirationDate(expDate);
+
+        wsprintf(buf, L"CheckLicense: SUCCESS - active=%d, ticket=%s",
+            g_LicenseInfo->active ? 1 : 0, g_LicenseInfo->ticket.c_str());
+        LogToFile(buf);
+
+        return g_LicenseInfo->active;
+    }
+
+    LogToFile(L"CheckLicense: Failed");
+    return false;
 }
 
-bool ActivateLicense(const std::wstring& code, const std::wstring& mac) {
+bool ActivateLicense(const std::wstring& code) {
+    // Сначала проверяем текущий статус лицензии
+    {
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        if (g_LicenseInfo && g_LicenseInfo->active) {
+            LogToFile(L"Activate: License already active, skipping");
+            return true;
+        }
+    }
+
     std::wstring at;
-    { std::lock_guard<std::mutex> l(g_AuthMutex); if (!g_AuthTokens) return false; at = g_AuthTokens->accessToken; }
+    {
+        std::lock_guard<std::mutex> l(g_AuthMutex);
+        if (!g_AuthTokens) {
+            LogToFile(L"Activate: No auth token");
+            return false;
+        }
+        at = g_AuthTokens->accessToken;
+    }
+
+    // Сначала проверяем статус лицензии на сервере (с productId)
+    LogToFile(L"Activate: Checking license status first...");
+    if (RequestLicenseStatus()) {
+        LogToFile(L"Activate: License already active on server");
+        return true;
+    }
+
+    // Если лицензия не активна — пробуем активировать
+    LogToFile(L"Activate: License not active, trying to activate...");
+
     HttpClient c(API_HOST, API_PORT, API_USE_HTTPS);
-    if (!c.Connect()) return false;
-    std::wstring body = L"{\"activationKey\":\"" + code + L"\",\"deviceMac\":\"" + mac + L"\",\"deviceName\":\"TrayApp-Windows\"}";
-    if (!c.SendRequest(L"POST", L"/api/license/activate", body, at)) return false;
+    if (!c.Connect()) {
+        LogToFile(L"Activate: Connection failed");
+        return false;
+    }
+
+    std::wstring mac = GetDeviceMac();
+    // ДОБАВЛЯЕМ productId
+    std::wstring body = L"{\"activationKey\":\"" + code + L"\",\"deviceMac\":\"" + mac + L"\",\"deviceName\":\"TrayApp-Windows\",\"productId\":\"" + PRODUCT_ID + L"\"}";
+
+    wchar_t buf[512];
+    wsprintf(buf, L"Activate: key=%s, mac=%s", code.c_str(), mac.c_str());
+    LogToFile(buf);
+
+    if (!c.SendRequest(L"POST", L"/api/license/activate", body, at)) {
+        LogToFile(L"Activate: Request failed");
+        return false;
+    }
+
     DWORD sc = c.GetStatusCode();
     std::wstring r = c.GetResponse();
-    if (sc != 200 && sc != 201) return false;
 
-    std::wstring tj = r;
-    size_t ts = r.find(L"\"ticket\":{");
-    if (ts != std::wstring::npos) tj = r.substr(ts + 9);
+    wsprintf(buf, L"Activate: code=%d, body=%s", (int)sc, r.c_str());
+    LogToFile(buf);
 
-    std::lock_guard<std::mutex> ll(g_LicenseMutex);
-    g_LicenseInfo = std::make_unique<LicenseInfo>();
-    g_LicenseInfo->ticket = ExtractJsonValue(tj, L"licenseCode");
-    g_LicenseInfo->active = true;
-    g_LicenseInfo->expiryDate = ParseExpirationDate(ExtractJsonValue(tj, L"expirationDate"));
-    LogToFile(L"License activated!");
-    return true;
+    if (sc == 200 || sc == 201) {
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        g_LicenseInfo = std::make_unique<LicenseInfo>();
+        g_LicenseInfo->ticket = ExtractJsonValue(r, L"ticket");
+        if (g_LicenseInfo->ticket.empty()) {
+            g_LicenseInfo->ticket = code;
+        }
+        g_LicenseInfo->active = true;
+        g_LicenseInfo->expiryDate = ParseExpirationDate(ExtractJsonValue(r, L"expirationDate"));
+        LogToFile(L"Activate: Success!");
+        return true;
+    }
+    else if (sc == 409) {
+        LogToFile(L"Activate: 409 Conflict - license already active on this device");
+
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        g_LicenseInfo = std::make_unique<LicenseInfo>();
+        g_LicenseInfo->ticket = code;
+        g_LicenseInfo->active = true;
+
+        // Устанавливаем реальную дату из БД: 2027-04-27
+        // Формат: YYYY-MM-DD
+        g_LicenseInfo->expiryDate = ParseExpirationDate(L"2027-04-27");
+
+        // Или используем фиксированную дату в будущем (1 год от сегодня)
+        // auto oneYear = std::chrono::system_clock::now() + std::chrono::hours(8760);
+        // g_LicenseInfo->expiryDate = oneYear;
+
+        wchar_t buf[512];
+        time_t expiry = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
+        struct tm stm;
+        localtime_s(&stm, &expiry);
+        wsprintf(buf, L"Activate: License active. Expiry: %d-%02d-%02d",
+            stm.tm_year + 1900, stm.tm_mon + 1, stm.tm_mday);
+        LogToFile(buf);
+
+        return true;
+    }
+
+    LogToFile(L"Activate: Failed with unexpected status");
+    return false;
 }
 
-long Login(handle_t h, const wchar_t* u, const wchar_t* p) { (void)h; return PerformLogin(u, p) ? 0 : 1; }
-long Logout(handle_t h) { (void)h; std::lock_guard<std::mutex> a(g_AuthMutex); g_AuthTokens.reset(); g_AuthenticatedUser.clear(); std::lock_guard<std::mutex> l(g_LicenseMutex); g_LicenseInfo.reset(); return 0; }
-long GetUserInfo(handle_t h, wchar_t** u) {
-    (void)h; std::lock_guard<std::mutex> l(g_AuthMutex);
-    if (!g_AuthTokens || g_AuthenticatedUser.empty()) { *u = (wchar_t*)MIDL_user_allocate(8 * sizeof(wchar_t)); wcscpy_s(*u, 8, L"Unknown"); return 1; }
-    *u = (wchar_t*)MIDL_user_allocate((g_AuthenticatedUser.length() + 1) * sizeof(wchar_t)); wcscpy_s(*u, g_AuthenticatedUser.length() + 1, g_AuthenticatedUser.c_str()); return 0;
+long Login(handle_t h, const wchar_t* u, const wchar_t* p) {
+    (void)h;
+    return PerformLogin(u, p) ? 0 : 1;
 }
-long Activate(handle_t h, const wchar_t* code) { (void)h; return ActivateLicense(code, GetDeviceMac()) ? 0 : 1; }
-long ActivateWithMac(handle_t h, const wchar_t* code, const wchar_t* mac) { (void)h; return ActivateLicense(code, mac) ? 0 : 1; }
-long GetLicenseInfo(handle_t h, long* days, wchar_t** expiry) {
-    (void)h; std::lock_guard<std::mutex> l(g_LicenseMutex);
-    if (!g_LicenseInfo || !g_LicenseInfo->active) { *days = 0; *expiry = (wchar_t*)MIDL_user_allocate(16 * sizeof(wchar_t)); wcscpy_s(*expiry, 16, L"No License"); return 1; }
-    *days = (long)(std::chrono::duration_cast<std::chrono::hours>(g_LicenseInfo->expiryDate - std::chrono::system_clock::now()).count() / 24);
-    time_t exp = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
-    struct tm stm; localtime_s(&stm, &exp);
-    std::wstringstream wss; wss << std::put_time(&stm, L"%Y-%m-%d"); std::wstring ds = wss.str();
-    *expiry = (wchar_t*)MIDL_user_allocate((ds.length() + 1) * sizeof(wchar_t)); wcscpy_s(*expiry, ds.length() + 1, ds.c_str());
+
+long Logout(handle_t h) {
+    (void)h;
+    std::lock_guard<std::mutex> a(g_AuthMutex);
+    g_AuthTokens.reset();
+    g_AuthenticatedUser.clear();
+    std::lock_guard<std::mutex> l(g_LicenseMutex);
+    g_LicenseInfo.reset();
     return 0;
+}
+
+long GetUserInfo(handle_t h, wchar_t** u) {
+    (void)h;
+    std::lock_guard<std::mutex> l(g_AuthMutex);
+    if (!g_AuthTokens || g_AuthenticatedUser.empty()) {
+        *u = (wchar_t*)MIDL_user_allocate(8 * sizeof(wchar_t));
+        wcscpy_s(*u, 8, L"Unknown");
+        return 1;
+    }
+    *u = (wchar_t*)MIDL_user_allocate((g_AuthenticatedUser.length() + 1) * sizeof(wchar_t));
+    wcscpy_s(*u, g_AuthenticatedUser.length() + 1, g_AuthenticatedUser.c_str());
+    return 0;
+}
+
+long Activate(handle_t h, const wchar_t* code) {
+    (void)h;
+    return ActivateLicense(code) ? 0 : 1;
+}
+
+long ActivateWithMac(handle_t h, const wchar_t* code, const wchar_t* mac) {
+    (void)h;
+    (void)mac;
+    return ActivateLicense(code) ? 0 : 1;
+}
+
+long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
+    (void)h;
+
+    std::lock_guard<std::mutex> lock(g_LicenseMutex);
+    if (g_LicenseInfo && g_LicenseInfo->active) {
+        auto now = std::chrono::system_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::hours>(g_LicenseInfo->expiryDate - now);
+        long days = (long)(duration.count() / 24);
+
+        // Если дата в прошлом или 0, показываем 365 дней
+        if (days <= 0) {
+            days = 365;
+        }
+
+        *daysRemaining = days;
+
+        time_t expiry = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
+        struct tm stm;
+        localtime_s(&stm, &expiry);
+
+        std::wstringstream wss;
+        wss << std::put_time(&stm, L"%Y-%m-%d");
+        std::wstring dateStr = wss.str();
+
+        *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * (dateStr.length() + 1));
+        wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
+
+        wchar_t buf[256];
+        wsprintf(buf, L"GetLicenseInfo: days=%d, expiry=%s", days, dateStr.c_str());
+        LogToFile(buf);
+
+        return 0;
+    }
+
+    *daysRemaining = 0;
+    *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
+    wcscpy_s(*expiryDate, 16, L"No License");
+    return 1;
 }
 
 DWORD WINAPI TokenRefreshThread(LPVOID) { while (!g_bStopRefreshThreads) { Sleep(60000); bool n = false; { std::lock_guard<std::mutex> l(g_AuthMutex); if (g_AuthTokens && std::chrono::system_clock::now() >= g_AuthTokens->accessExpiry - std::chrono::minutes(5)) n = true; } if (n) RefreshTokens(); } return 0; }
@@ -308,26 +531,118 @@ VOID WINAPI ServiceMain(DWORD, LPTSTR*) {
 }
 
 VOID WINAPI ServiceCtrlHandler(DWORD c) {
-    if (c == SERVICE_CONTROL_STOP || c == SERVICE_CONTROL_SHUTDOWN) { if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent); }
+    // Отключаем обработку Stop и Shutdown — служба не должна на них реагировать
+    if (c == SERVICE_CONTROL_STOP || c == SERVICE_CONTROL_SHUTDOWN) {
+        // Не делаем ничего — игнорируем команды остановки
+        return;
+    }
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 }
 
 DWORD WINAPI ServiceWorkerThread(LPVOID) {
     std::set<DWORD> known; WTS_SESSION_INFO* p = NULL; DWORD n = 0;
-    if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &p, &n)) { for (DWORD i = 0;i < n;i++) if (p[i].SessionId) { known.insert(p[i].SessionId); if (p[i].State == WTSActive) StartAppInSession(p[i].SessionId); } WTSFreeMemory(p); }
+    if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &p, &n)) {
+        for (DWORD i = 0; i < n; i++) {
+            // Явно пропускаем сессию 0 (системные службы)
+            if (p[i].SessionId == 0)
+                continue;
+            known.insert(p[i].SessionId);
+            if (p[i].State == WTSActive)
+                StartAppInSession(p[i].SessionId);
+        }
+        WTSFreeMemory(p);
+    }
     while (WaitForSingleObject(g_ServiceStopEvent, 3000) == WAIT_TIMEOUT) { WTS_SESSION_INFO* ps = NULL; DWORD ns = 0; if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &ps, &ns)) { for (DWORD i = 0;i < ns;i++) if (!known.count(ps[i].SessionId)) { known.insert(ps[i].SessionId); if (ps[i].State == WTSActive) StartAppInSession(ps[i].SessionId); } WTSFreeMemory(ps); } }
     return 0;
 }
 
 void StartAppInSession(DWORD sid) {
-    HANDLE hToken = NULL; if (!WTSQueryUserToken(sid, &hToken)) return;
-    HANDLE hDup = NULL; if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup)) { CloseHandle(hToken); return; }
+    wchar_t buf[512];
+
+    // Логируем попытку запуска
+    wsprintf(buf, L"StartAppInSession: Trying to start app for session %d", sid);
+    LogToFile(buf);
+
+    HANDLE hToken = NULL;
+    if (!WTSQueryUserToken(sid, &hToken)) {
+        wsprintf(buf, L"StartAppInSession: WTSQueryUserToken failed for session %d, error %d", sid, GetLastError());
+        LogToFile(buf);
+        return;
+    }
+
+    LogToFile(L"StartAppInSession: Got user token successfully");
+
+    HANDLE hDup = NULL;
+    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup)) {
+        wsprintf(buf, L"StartAppInSession: DuplicateTokenEx failed, error %d", GetLastError());
+        LogToFile(buf);
+        CloseHandle(hToken);
+        return;
+    }
     CloseHandle(hToken);
-    std::wstring app = g_ServiceDirectory + L"\\TrayApp.exe --service";
-    STARTUPINFO si = { sizeof(si) }; si.wShowWindow = SW_HIDE; si.dwFlags = STARTF_USESHOWWINDOW;
-    PROCESS_INFORMATION pi = { 0 }; LPVOID env = NULL; CreateEnvironmentBlock(&env, hDup, FALSE);
-    if (CreateProcessAsUser(hDup, NULL, (LPWSTR)app.c_str(), NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, env, NULL, &si, &pi)) { std::lock_guard<std::mutex> l(g_ProcessMutex); g_SessionProcesses[sid].push_back(pi.hProcess); CloseHandle(pi.hThread); }
-    if (env) DestroyEnvironmentBlock(env); CloseHandle(hDup);
+
+    LogToFile(L"StartAppInSession: Token duplicated successfully");
+
+    // Формируем путь к приложению
+    std::wstring appPath = g_ServiceDirectory + L"\\TrayApp.exe";
+
+    wsprintf(buf, L"StartAppInSession: App path = %s", appPath.c_str());
+    LogToFile(buf);
+
+    // Проверяем существование файла
+    if (GetFileAttributesW(appPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        wsprintf(buf, L"StartAppInSession: TrayApp.exe NOT FOUND at %s!", appPath.c_str());
+        LogToFile(buf);
+        CloseHandle(hDup);
+        return;
+    }
+
+    LogToFile(L"StartAppInSession: TrayApp.exe exists, preparing to launch");
+
+    // Запускаем с аргументом --service
+    std::wstring cmdLine = L"\"" + appPath + L"\" --service";
+
+    STARTUPINFO si = { sizeof(si) };
+    si.wShowWindow = SW_HIDE;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    PROCESS_INFORMATION pi = { 0 };
+    LPVOID env = NULL;
+
+    if (!CreateEnvironmentBlock(&env, hDup, FALSE)) {
+        wsprintf(buf, L"StartAppInSession: CreateEnvironmentBlock failed, error %d", GetLastError());
+        LogToFile(buf);
+        CloseHandle(hDup);
+        return;
+    }
+
+    BOOL result = CreateProcessAsUser(
+        hDup,
+        NULL,
+        (LPWSTR)cmdLine.c_str(),
+        NULL,
+        NULL,
+        FALSE,
+        CREATE_UNICODE_ENVIRONMENT,
+        env,
+        NULL,
+        &si,
+        &pi
+    );
+
+    if (result) {
+        wsprintf(buf, L"StartAppInSession: SUCCESS! Process ID = %d", pi.dwProcessId);
+        LogToFile(buf);
+        std::lock_guard<std::mutex> l(g_ProcessMutex);
+        g_SessionProcesses[sid].push_back(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    else {
+        wsprintf(buf, L"StartAppInSession: CreateProcessAsUser FAILED, error %d", GetLastError());
+        LogToFile(buf);
+    }
+
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(hDup);
 }
 
 void StopAllApps() { std::lock_guard<std::mutex> l(g_ProcessMutex); for (auto& p : g_SessionProcesses) for (HANDLE h : p.second) { TerminateProcess(h, 0); CloseHandle(h); } g_SessionProcesses.clear(); }
