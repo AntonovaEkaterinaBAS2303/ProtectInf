@@ -2,9 +2,9 @@ name: Build TrayApp Windows Service
 
 on:
   push:
-    branches: [main, master, feature/windows-service-rpc]
+    branches: ['**'] 
   pull_request:
-    branches: [main, master]
+    branches: ['**']
 
 jobs:
   build:
@@ -13,9 +13,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
     
     - name: Configure CMake
       run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
