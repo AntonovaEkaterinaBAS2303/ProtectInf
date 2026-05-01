@@ -14,6 +14,21 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+    
+    - name: Generate RPC stubs
+      run: |
+        mkdir generated
+        midl /out generated /h generated\service_rpc.h /cstub generated\rpc_c.c /sstub generated\rpc_s.c src\common\rpc_interface.idl
+      working-directory: ${{ github.workspace }}
+    
+    - name: Copy RPC files to common
+      run: |
+        copy generated\service_rpc.h src\common\service_rpc.h /Y
+        copy generated\rpc_c.c src\common\rpc_c.c /Y
+        copy generated\rpc_s.c src\common\rpc_s.c /Y
+    
     - name: Configure CMake
       run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
     
