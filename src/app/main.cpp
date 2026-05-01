@@ -220,14 +220,30 @@ INT_PTR CALLBACK ActivationDlgProc(HWND h, UINT m, WPARAM w, LPARAM) {
 
 DWORD WINAPI LicenseMonitorThread(LPVOID) {
     while (true) {
-        Sleep(60000);
+        Sleep(30000); // Проверка каждые 30 секунд
         if (g_bAuthenticated) {
-            std::wstring u; if (RpcGetUserInfo(u) != 0) { g_bAuthenticated = false; g_bLicensed = false; PostMessage(g_hWnd, WM_USER + 100, 0, 0); continue; }
-            long d; std::wstring e;
+            std::wstring u;
+            if (RpcGetUserInfo(u) != 0) {
+                g_bAuthenticated = false;
+                g_bLicensed = false;
+                PostMessage(g_hWnd, WM_USER + 100, 0, 0);
+                continue;
+            }
+
+            long d;
+            std::wstring e;
             bool was = g_bLicensed;
             g_bLicensed = (RpcGetLicenseInfo(d, e) == 0);
-            if (g_bLicensed) { g_LicenseDaysRemaining = d; g_LicenseExpiryDate = e; }
-            if (was != g_bLicensed) PostMessage(g_hWnd, WM_USER + 100, 0, 0);
+
+            if (g_bLicensed) {
+                g_LicenseDaysRemaining = d;
+                g_LicenseExpiryDate = e;
+            }
+
+            // Если статус изменился - обновляем UI
+            if (was != g_bLicensed) {
+                PostMessage(g_hWnd, WM_USER + 100, 0, 0);
+            }
         }
     }
     return 0;

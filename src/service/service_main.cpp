@@ -201,7 +201,44 @@ public:
         } while (s > 0);
         return r;
     }
-    DWORD GetStatusCode() { DWORD sc = 0, scs = sizeof(sc); WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scs, WINHTTP_NO_HEADER_INDEX); return sc; }
+    DWORD GetStatusCode() {
+        DWORD sc = 0;
+        DWORD scs = sizeof(sc);
+
+        // Для HTTPS с самоподписанными сертификатами используем текстовый формат
+        wchar_t statusText[16] = { 0 };
+        DWORD size = sizeof(statusText);
+
+        BOOL result = WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_STATUS_CODE,  // БЕЗ FLAG_NUMBER!
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            statusText,
+            &size,
+            WINHTTP_NO_HEADER_INDEX);
+
+        if (result) {
+            sc = _wtoi(statusText);
+            return sc;
+        }
+
+        // Запасной вариант: пробуем с FLAG_NUMBER
+        sc = 0;
+        scs = sizeof(sc);
+        result = WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &sc,
+            &scs,
+            WINHTTP_NO_HEADER_INDEX);
+
+        if (result && sc >= 100 && sc <= 599) {
+            return sc;
+        }
+
+        return 0;
+    }
 };
 
 bool PerformLogin(const std::wstring& u, const std::wstring& p) {
@@ -244,83 +281,79 @@ bool RequestLicenseStatus() {
     std::wstring accessToken;
     {
         std::lock_guard<std::mutex> authLock(g_AuthMutex);
-        if (!g_AuthTokens) {
-            LogToFile(L"CheckLicense: No auth token");
-            return false;
-        }
+        if (!g_AuthTokens) { LogToFile(L"CheckLicense: No auth token"); return false; }
         accessToken = g_AuthTokens->accessToken;
     }
 
-    wchar_t buf[512];
-    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
-    if (!client.Connect()) {
-        LogToFile(L"CheckLicense: Connection failed");
-        return false;
-    }
-
-    // ДОБАВЛЯЕМ productId - он ОБЯЗАТЕЛЕН!
-    std::wstring body = L"{\"deviceMac\":\"" + GetDeviceMac() + L"\",\"productId\":\"" + PRODUCT_ID + L"\"}";
-
-    LogToFile((L"CheckLicense: Request body: " + body).c_str());
-
-    if (!client.SendRequest(L"POST", L"/api/license/check", body, accessToken)) {
-        LogToFile(L"CheckLicense: Request failed");
-        return false;
-    }
-
-    DWORD statusCode = client.GetStatusCode();
-    std::wstring response = client.GetResponse();
-
-    wsprintf(buf, L"CheckLicense: code=%d, body=%s", (int)statusCode, response.c_str());
-    LogToFile(buf);
-
-    if (statusCode == 200) {
-        // Парсим ответ
-        std::wstring expired = ExtractJsonValue(response, L"expired");
-        bool isActive = (expired == L"false" || expired.empty());
-
-        // Проверяем также поле active
-        std::wstring activeStr = ExtractJsonValue(response, L"active");
-        if (!activeStr.empty()) {
-            isActive = (activeStr == L"true");
-        }
-
+    std::wstring lastCode;
+    {
         std::lock_guard<std::mutex> ll(g_LicenseMutex);
-        g_LicenseInfo = std::make_unique<LicenseInfo>();
-        g_LicenseInfo->active = isActive;
-        g_LicenseInfo->ticket = ExtractJsonValue(response, L"licenseCode");
-        if (g_LicenseInfo->ticket.empty()) {
-            g_LicenseInfo->ticket = ExtractJsonValue(response, L"ticket");
+        if (g_LicenseInfo && !g_LicenseInfo->ticket.empty()) {
+            lastCode = g_LicenseInfo->ticket;
         }
-        if (g_LicenseInfo->ticket.empty()) {
-            g_LicenseInfo->ticket = ExtractJsonValue(response, L"code");
-        }
-
-        std::wstring expDate = ExtractJsonValue(response, L"expirationDate");
-        if (expDate.empty()) {
-            expDate = ExtractJsonValue(response, L"endingDate");
-        }
-        g_LicenseInfo->expiryDate = ParseExpirationDate(expDate);
-
-        wsprintf(buf, L"CheckLicense: SUCCESS - active=%d, ticket=%s",
-            g_LicenseInfo->active ? 1 : 0, g_LicenseInfo->ticket.c_str());
-        LogToFile(buf);
-
-        return g_LicenseInfo->active;
     }
 
-    LogToFile(L"CheckLicense: Failed");
-    return false;
+    if (lastCode.empty()) return false;
+
+    wchar_t buf[512];
+
+    // Используем /api/license/activate для проверки статуса
+    HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
+    if (client.Connect()) {
+        std::wstring body = L"{\"activationKey\":\"" + lastCode + L"\",\"deviceMac\":\"" + GetDeviceMac() + L"\",\"deviceName\":\"TrayApp-Windows\",\"productId\":\"" + PRODUCT_ID + L"\"}";
+
+        if (client.SendRequest(L"POST", L"/api/license/activate", body, accessToken)) {
+            DWORD sc = client.GetStatusCode();
+            std::wstring r = client.GetResponse();
+
+            wsprintf(buf, L"CheckLicense: /api/license/activate returned %d", (int)sc);
+            LogToFile(buf);
+
+            if (sc == 200 || sc == 201) {
+                // Извлекаем статус из ответа
+                std::wstring blocked = ExtractJsonValue(r, L"blocked");
+                std::wstring expired = ExtractJsonValue(r, L"expired");
+
+                bool isActive = (blocked != L"true" && expired != L"true");
+
+                std::lock_guard<std::mutex> ll(g_LicenseMutex);
+                if (!g_LicenseInfo) g_LicenseInfo = std::make_unique<LicenseInfo>();
+                g_LicenseInfo->active = isActive;
+
+                std::wstring expDate = ExtractJsonValue(r, L"expirationDate");
+                if (!expDate.empty()) g_LicenseInfo->expiryDate = ParseExpirationDate(expDate);
+
+                LogToFile(isActive ? L"CheckLicense: ACTIVE" : L"CheckLicense: BLOCKED/EXPIRED");
+                return isActive;
+            }
+            else if (sc == 409) {
+                LogToFile(L"CheckLicense: 409 - device limit, assuming active");
+                return true;
+            }
+            else if (sc == 403 || sc == 404) {
+                LogToFile(L"CheckLicense: License not accessible");
+                std::lock_guard<std::mutex> ll(g_LicenseMutex);
+                if (g_LicenseInfo) g_LicenseInfo->active = false;
+                return false;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> ll(g_LicenseMutex);
+    return g_LicenseInfo && g_LicenseInfo->active;
 }
 
 bool ActivateLicense(const std::wstring& code) {
-    // Сначала проверяем текущий статус лицензии
+    LogToFile(L"Activate: START");
+
+    // Проверяем кэш
     {
         std::lock_guard<std::mutex> ll(g_LicenseMutex);
         if (g_LicenseInfo && g_LicenseInfo->active) {
-            LogToFile(L"Activate: License already active, skipping");
+            LogToFile(L"Activate: Already active in cache - returning true");
             return true;
         }
+        LogToFile(L"Activate: Not active in cache");
     }
 
     std::wstring at;
@@ -331,17 +364,11 @@ bool ActivateLicense(const std::wstring& code) {
             return false;
         }
         at = g_AuthTokens->accessToken;
+        LogToFile(L"Activate: Got auth token");
     }
 
-    // Сначала проверяем статус лицензии на сервере (с productId)
-    LogToFile(L"Activate: Checking license status first...");
-    if (RequestLicenseStatus()) {
-        LogToFile(L"Activate: License already active on server");
-        return true;
-    }
-
-    // Если лицензия не активна — пробуем активировать
-    LogToFile(L"Activate: License not active, trying to activate...");
+    // Пропускаем RequestLicenseStatus (он всё равно не работает)
+    LogToFile(L"Activate: Skipping RequestLicenseStatus, calling activate directly");
 
     HttpClient c(API_HOST, API_PORT, API_USE_HTTPS);
     if (!c.Connect()) {
@@ -350,64 +377,77 @@ bool ActivateLicense(const std::wstring& code) {
     }
 
     std::wstring mac = GetDeviceMac();
-    // ДОБАВЛЯЕМ productId
     std::wstring body = L"{\"activationKey\":\"" + code + L"\",\"deviceMac\":\"" + mac + L"\",\"deviceName\":\"TrayApp-Windows\",\"productId\":\"" + PRODUCT_ID + L"\"}";
 
     wchar_t buf[512];
-    wsprintf(buf, L"Activate: key=%s, mac=%s", code.c_str(), mac.c_str());
+    wsprintf(buf, L"Activate: Sending request with key=%s", code.c_str());
     LogToFile(buf);
 
     if (!c.SendRequest(L"POST", L"/api/license/activate", body, at)) {
-        LogToFile(L"Activate: Request failed");
+        LogToFile(L"Activate: SendRequest failed");
         return false;
     }
 
     DWORD sc = c.GetStatusCode();
     std::wstring r = c.GetResponse();
 
-    wsprintf(buf, L"Activate: code=%d, body=%s", (int)sc, r.c_str());
+    wsprintf(buf, L"Activate: Response code=%d, body length=%zu", (int)sc, r.length());
     LogToFile(buf);
 
-    if (sc == 200 || sc == 201) {
+    // Проверяем НЕ по коду статуса, а по содержимому ответа
+    if (r.find(L"\"ticket\":{") != std::wstring::npos ||
+        r.find(L"\"licenseCode\":\"") != std::wstring::npos ||
+        r.find(L"\"blocked\":false") != std::wstring::npos) {
+
+        LogToFile(L"Activate: Valid license data found in response");
+
         std::lock_guard<std::mutex> ll(g_LicenseMutex);
         g_LicenseInfo = std::make_unique<LicenseInfo>();
-        g_LicenseInfo->ticket = ExtractJsonValue(r, L"ticket");
-        if (g_LicenseInfo->ticket.empty()) {
-            g_LicenseInfo->ticket = code;
+
+        std::wstring ticketCode = ExtractJsonValue(r, L"licenseCode");
+        if (ticketCode.empty()) {
+            size_t pos = r.find(L"\"ticket\":{");
+            if (pos != std::wstring::npos) {
+                std::wstring ticketJson = r.substr(pos + 9);
+                ticketCode = ExtractJsonValue(ticketJson, L"licenseCode");
+            }
         }
-        g_LicenseInfo->active = true;
-        g_LicenseInfo->expiryDate = ParseExpirationDate(ExtractJsonValue(r, L"expirationDate"));
-        LogToFile(L"Activate: Success!");
-        return true;
-    }
-    else if (sc == 409) {
-        LogToFile(L"Activate: 409 Conflict - license already active on this device");
 
-        std::lock_guard<std::mutex> ll(g_LicenseMutex);
-        g_LicenseInfo = std::make_unique<LicenseInfo>();
-        g_LicenseInfo->ticket = code;
+        g_LicenseInfo->ticket = ticketCode.empty() ? code : ticketCode;
         g_LicenseInfo->active = true;
 
-        // Устанавливаем реальную дату из БД: 2027-04-27
-        // Формат: YYYY-MM-DD
-        g_LicenseInfo->expiryDate = ParseExpirationDate(L"2027-04-27");
+        std::wstring expDate = ExtractJsonValue(r, L"expirationDate");
+        if (expDate.empty()) {
+            size_t pos = r.find(L"\"ticket\":{");
+            if (pos != std::wstring::npos) {
+                std::wstring ticketJson = r.substr(pos + 9);
+                expDate = ExtractJsonValue(ticketJson, L"expirationDate");
+            }
+        }
 
-        // Или используем фиксированную дату в будущем (1 год от сегодня)
-        // auto oneYear = std::chrono::system_clock::now() + std::chrono::hours(8760);
-        // g_LicenseInfo->expiryDate = oneYear;
+        g_LicenseInfo->expiryDate = ParseExpirationDate(expDate);
 
-        wchar_t buf[512];
-        time_t expiry = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
-        struct tm stm;
-        localtime_s(&stm, &expiry);
-        wsprintf(buf, L"Activate: License active. Expiry: %d-%02d-%02d",
-            stm.tm_year + 1900, stm.tm_mon + 1, stm.tm_mday);
+        std::wstring blocked = ExtractJsonValue(r, L"blocked");
+        std::wstring expired = ExtractJsonValue(r, L"expired");
+
+        if (blocked == L"true") g_LicenseInfo->active = false;
+        if (expired == L"true") g_LicenseInfo->active = false;
+
+        wsprintf(buf, L"Activate: SUCCESS - ticket=%s, active=%d",
+            g_LicenseInfo->ticket.c_str(), g_LicenseInfo->active ? 1 : 0);
         LogToFile(buf);
 
-        return true;
+        return g_LicenseInfo->active;
     }
 
-    LogToFile(L"Activate: Failed with unexpected status");
+    // Если данные не найдены - проверяем на ошибки
+    if (r.find(L"\"error\"") != std::wstring::npos) {
+        std::wstring error = ExtractJsonValue(r, L"error");
+        wsprintf(buf, L"Activate: Server error: %s", error.c_str());
+        LogToFile(buf);
+    }
+
+    LogToFile(L"Activate: No valid license data found - returning false");
     return false;
 }
 
@@ -453,16 +493,24 @@ long ActivateWithMac(handle_t h, const wchar_t* code, const wchar_t* mac) {
 long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
     (void)h;
 
+    // ВСЕГДА проверяем актуальный статус на сервере
+    bool hasToken = false;
+    {
+        std::lock_guard<std::mutex> lock(g_AuthMutex);
+        hasToken = (g_AuthTokens && !g_AuthenticatedUser.empty());
+    }
+
+    if (hasToken) {
+        LogToFile(L"GetLicenseInfo: Checking server for current status...");
+        RequestLicenseStatus();
+    }
+
     std::lock_guard<std::mutex> lock(g_LicenseMutex);
     if (g_LicenseInfo && g_LicenseInfo->active) {
         auto now = std::chrono::system_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::hours>(g_LicenseInfo->expiryDate - now);
         long days = (long)(duration.count() / 24);
-
-        // Если дата в прошлом или 0, показываем 365 дней
-        if (days <= 0) {
-            days = 365;
-        }
+        if (days <= 0) days = 365;
 
         *daysRemaining = days;
 
@@ -491,7 +539,25 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
 }
 
 DWORD WINAPI TokenRefreshThread(LPVOID) { while (!g_bStopRefreshThreads) { Sleep(60000); bool n = false; { std::lock_guard<std::mutex> l(g_AuthMutex); if (g_AuthTokens && std::chrono::system_clock::now() >= g_AuthTokens->accessExpiry - std::chrono::minutes(5)) n = true; } if (n) RefreshTokens(); } return 0; }
-DWORD WINAPI LicenseRefreshThread(LPVOID) { while (!g_bStopRefreshThreads) { Sleep(3600000); bool n = false; { std::lock_guard<std::mutex> l(g_LicenseMutex); if (g_LicenseInfo && g_LicenseInfo->active && std::chrono::system_clock::now() >= g_LicenseInfo->expiryDate - std::chrono::hours(24)) n = true; } if (n) RequestLicenseStatus(); } return 0; }
+DWORD WINAPI LicenseRefreshThread(LPVOID) {
+    while (!g_bStopRefreshThreads) {
+        Sleep(60000); // Проверяем каждую минуту (вместо часа)
+        bool needCheck = false;
+        {
+            std::lock_guard<std::mutex> l(g_LicenseMutex);
+            needCheck = (g_LicenseInfo && g_LicenseInfo->active);
+        }
+        if (needCheck) {
+            LogToFile(L"LicenseRefresh: Periodic check...");
+            bool isActive = RequestLicenseStatus();
+            if (!isActive) {
+                LogToFile(L"LicenseRefresh: License no longer active!");
+                // Уведомляем GUI через RPC (можно добавить колбэк)
+            }
+        }
+    }
+    return 0;
+}
 void StartRefreshThreads() { g_bStopRefreshThreads = false; g_hRefreshThread = CreateThread(NULL, 0, TokenRefreshThread, NULL, 0, NULL); g_hLicenseRefreshThread = CreateThread(NULL, 0, LicenseRefreshThread, NULL, 0, NULL); }
 
 DWORD WINAPI RpcServerThread(LPVOID) {
