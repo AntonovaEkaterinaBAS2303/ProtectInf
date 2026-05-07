@@ -8,7 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(WIN32)
     add_executable(TrayApp WIN32
         src/main.cpp
-        src/resource.h
         src/app.rc
     )
     
@@ -16,6 +15,7 @@ if(WIN32)
         UNICODE
         _UNICODE
         WIN32_LEAN_AND_MEAN
+        _WIN32_IE=0x0600
     )
     
     # Add include directories for resource files
@@ -29,6 +29,7 @@ if(WIN32)
         shell32
         user32
         gdi32
+        kernel32
     )
     
     # Set output directory

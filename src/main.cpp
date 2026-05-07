@@ -1,8 +1,12 @@
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <tchar.h>
 #include <string>
-#include "resource.h"
+
+// Resource identifiers
+#define IDC_TRAYAPP 101
+#define IDI_TRAYAPP 102
 
 // Constants
 #define WM_TRAYICON (WM_APP + 1)
@@ -54,8 +58,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
     }
 
     // Initialize common controls
-    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_COOL_CLASSES };
-    InitCommonControlsEx(&icex);
+    InitCommonControls();
 
     g_hInstance = hInstance;
 
@@ -206,21 +209,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_CLOSE:
+    {
         // Hide window instead of closing
         ShowWindow(hWnd, SW_HIDE);
         g_bMainWindowVisible = false;
 
-        // Optional: Show notification
-        NOTIFYICONDATA nid = { sizeof(NOTIFYICONDATA) };
-        nid.hWnd = hWnd;
-        nid.uID = ID_TRAY_ICON;
-        nid.uFlags = NIF_INFO;
-        nid.dwInfoFlags = NIIF_INFO;
-        _tcscpy_s(nid.szInfoTitle, _T("TrayApp"));
-        _tcscpy_s(nid.szInfo, _T("Приложение продолжает работу в фоновом режиме"));
-        Shell_NotifyIcon(NIM_MODIFY, &nid);
+        // Show notification
+        NOTIFYICONDATA nidNotify = { sizeof(NOTIFYICONDATA) };
+        nidNotify.hWnd = hWnd;
+        nidNotify.uID = ID_TRAY_ICON;
+        nidNotify.uFlags = NIF_INFO;
+        nidNotify.dwInfoFlags = NIIF_INFO;
+        _tcscpy_s(nidNotify.szInfoTitle, _T("TrayApp"));
+        _tcscpy_s(nidNotify.szInfo, _T("Application is running in background"));
+        Shell_NotifyIcon(NIM_MODIFY, &nidNotify);
 
         return 0; // Prevent default close behavior
+    }
 
     case WM_DESTROY:
         RemoveTrayIcon();
@@ -266,9 +271,9 @@ void ShowContextMenu(HWND hWnd)
     if (hMenu)
     {
         // Add menu items
-        InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN, _T("Открыть"));
+        InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN, _T("Open"));
         InsertMenu(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-        InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, _T("Выход"));
+        InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, _T("Exit"));
 
         // Set default menu item
         SetMenuDefaultItem(hMenu, IDM_OPEN, FALSE);
