@@ -53,6 +53,8 @@ HANDLE g_ServiceStopEvent = NULL;
 std::map<DWORD, std::vector<HANDLE>> g_SessionProcesses;
 std::mutex g_ProcessMutex;
 std::wstring g_ServiceDirectory;
+HANDLE g_hSessionNotification = NULL;
+bool g_bServiceStopping = false;
 
 struct AuthTokens { std::wstring accessToken, refreshToken; std::chrono::system_clock::time_point accessExpiry, refreshExpiry; };
 struct LicenseInfo { std::wstring ticket; std::chrono::system_clock::time_point expiryDate; bool active; };
@@ -652,24 +654,53 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 VOID WINAPI ServiceMain(DWORD, LPTSTR*) {
     g_StatusHandle = RegisterServiceCtrlHandler(SERVICE_NAME, ServiceCtrlHandler);
     ZeroMemory(&g_ServiceStatus, sizeof(g_ServiceStatus));
-    g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS; g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING; SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+    g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_ServiceStatus.dwServiceType |= SERVICE_ACCEPT_SESSIONCHANGE;
+    g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
     g_ServiceStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE hRpc = CreateThread(NULL, 0, RpcServerThread, NULL, 0, NULL), hWorker = CreateThread(NULL, 0, ServiceWorkerThread, NULL, 0, NULL);
-    g_ServiceStatus.dwCurrentState = SERVICE_RUNNING; SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+    HANDLE hRpc = CreateThread(NULL, 0, RpcServerThread, NULL, 0, NULL);
+    HANDLE hWorker = CreateThread(NULL, 0, ServiceWorkerThread, NULL, 0, NULL);
+
+    g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
     StartRefreshThreads();
     WaitForSingleObject(g_ServiceStopEvent, INFINITE);
-    g_bStopRefreshThreads = true; StopAllApps(); RpcMgmtStopServerListening(NULL);
+
+    g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+    g_bStopRefreshThreads = true;
+    StopAllApps();
+    RpcMgmtStopServerListening(NULL);
+
     if (hRpc) { WaitForSingleObject(hRpc, 5000); CloseHandle(hRpc); }
     if (hWorker) { WaitForSingleObject(hWorker, 5000); CloseHandle(hWorker); }
     CloseHandle(g_ServiceStopEvent);
-    g_ServiceStatus.dwCurrentState = SERVICE_STOPPED; SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+    g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 }
 
 VOID WINAPI ServiceCtrlHandler(DWORD c) {
-    // Отключаем обработку Stop и Shutdown — служба не должна на них реагировать
-    if (c == SERVICE_CONTROL_STOP || c == SERVICE_CONTROL_SHUTDOWN) {
-        // Не делаем ничего — игнорируем команды остановки
+    switch (c) {
+    case SERVICE_CONTROL_STOP:
+    case SERVICE_CONTROL_SHUTDOWN:
+        // Игнорируем
         return;
+
+    case SERVICE_CONTROL_SESSIONCHANGE:
+    {
+        // Обработка смены сессии
+        DWORD sessionId = WTSGetActiveConsoleSessionId();
+        if (sessionId != 0xFFFFFFFF) {
+            StartAppInSession(sessionId);
+        }
+    }
+    break;
     }
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 }
@@ -834,4 +865,40 @@ void StartAppInSession(DWORD sid) {
     CloseHandle(hDup);
 }
 
-void StopAllApps() { std::lock_guard<std::mutex> l(g_ProcessMutex); for (auto& p : g_SessionProcesses) for (HANDLE h : p.second) { TerminateProcess(h, 0); CloseHandle(h); } g_SessionProcesses.clear(); }
+void StopAllApps() {
+    std::lock_guard<std::mutex> l(g_ProcessMutex);
+
+    for (auto& p : g_SessionProcesses) {
+        for (HANDLE h : p.second) {
+            DWORD pid = GetProcessId(h);
+
+            LogToFile(L"StopAllApps: Sending WM_CLOSE to app");
+
+            // Сначала пробуем закрыть окно через WM_CLOSE
+            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                DWORD wndPid = 0;
+                GetWindowThreadProcessId(hwnd, &wndPid);
+                if (wndPid == (DWORD)lParam) {
+                    PostMessage(hwnd, WM_CLOSE, 0, 0);
+                    return FALSE;
+                }
+                return TRUE;
+                }, (LPARAM)pid);
+
+            // Ждём 3 секунды
+            DWORD waitResult = WaitForSingleObject(h, 3000);
+
+            if (waitResult == WAIT_TIMEOUT) {
+                // Не завершился - принудительно
+                LogToFile(L"StopAllApps: App did not close, terminating");
+                TerminateProcess(h, 0);
+            }
+            else {
+                LogToFile(L"StopAllApps: App closed gracefully");
+            }
+
+            CloseHandle(h);
+        }
+    }
+    g_SessionProcesses.clear();
+}

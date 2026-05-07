@@ -304,6 +304,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     }
     case WM_TIMER:
+        if (w == 900) {
+            AddTrayIcon(h);
+            KillTimer(h, 900);
+        }
         if (w == 999) {
             if (InitRpcBinding()) {
                 KillTimer(h, 999);
@@ -320,7 +324,20 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND:
         if (LOWORD(w) == IDM_OPEN) ShowMainWindow(h);
         if (LOWORD(w) == IDM_EXIT || LOWORD(w) == ID_FILE_EXIT) {
-            RpcLogout(); StopWindowsService(); DestroyWindow(h);
+            // Подтверждение на Secure Desktop
+            int result = MessageBoxW(
+                NULL,
+                L"Do you want to stop the TrayApp Service?\n\n"
+                L"This will close all TrayApp applications in all sessions.",
+                L"TrayApp - Stop Service",
+                MB_SERVICE_NOTIFICATION | MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2
+            );
+
+            if (result == IDYES) {
+                RpcLogout();
+                StopWindowsService();
+                DestroyWindow(h);
+            }
         }
         break;
     case WM_CLOSE: ShowWindow(h, SW_HIDE); g_bMainWindowVisible = false; return 0;
@@ -361,54 +378,89 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int) {
         return 0;
     }
 
-    // Проверка родительского процесса
-    bool parentCheckPassed = false;
-    DWORD parentPid = GetParentProcessId();
-    HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
-    if (hParent) {
-        wchar_t parentPath[MAX_PATH] = { 0 };
-        DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameW(hParent, 0, parentPath, &size)) {
-            std::wstring path(parentPath);
-            if (path.find(L"TrayService.exe") != std::wstring::npos) {
-                parentCheckPassed = true;
-            }
-        }
-        CloseHandle(hParent);
-    }
-
-    // Если не удалось открыть процесс ИЛИ проверка не пройдена
-    if (!parentCheckPassed) {
-        // Дополнительная проверка: служба должна работать
-        if (!EnsureServiceRunning()) {
-            return 0; // Служба не работает - выходим
-        }
-        // Если служба работает, но родителя проверить не удалось -
-        // всё равно продолжаем (мы с флагом --service)
-    }
-
-    // Создание окна
+    // Регистрируем класс окна (без меню, без заголовка)
     WNDCLASSEX wc = { sizeof(wc) };
-    wc.lpfnWndProc = WndProc; wc.hInstance = hi;
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); wc.lpszMenuName = MAKEINTRESOURCE(IDC_TRAYAPP);
-    wc.lpszClassName = _T("TrayAppClass"); wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hi;
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = _T("TrayAppClass");
+    wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+
     if (!RegisterClassEx(&wc)) return 1;
 
-    g_hWnd = CreateWindow(_T("TrayAppClass"), _T("TrayApp"), WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, 500, 300, NULL, NULL, hi, NULL);
+    // Создаём СКРЫТОЕ окно (только для иконки в трее)
+    g_hWnd = CreateWindowEx(
+        0,
+        _T("TrayAppClass"),
+        _T("TrayApp"),
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, 500, 300,
+        NULL, NULL, hi, NULL);
+
     if (!g_hWnd) return 1;
 
-    g_uTaskbarRestart = RegisterWindowMessage(_T("TaskbarCreated"));
-    AddTrayIcon(g_hWnd);
+    // Скрываем окно
+    ShowWindow(g_hWnd, SW_HIDE);
+    UpdateWindow(g_hWnd);
     g_bMainWindowVisible = false;
 
+    g_uTaskbarRestart = RegisterWindowMessage(_T("TaskbarCreated"));
+
+    // Добавляем иконку с задержкой (Explorer может быть не готов)
+    Sleep(2000);
+    AddTrayIcon(g_hWnd);
+    // Повторная попытка через 5 секунд
+    SetTimer(g_hWnd, 900, 5000, NULL);
+
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
     return 0;
 }
 
-void AddTrayIcon(HWND h) { ZeroMemory(&g_nid, sizeof(g_nid)); g_nid.cbSize = sizeof(g_nid); g_nid.hWnd = h; g_nid.uID = ID_TRAY_ICON; g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; g_nid.uCallbackMessage = WM_TRAYICON; g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION); _tcscpy_s(g_nid.szTip, _T("Tray App")); Shell_NotifyIcon(NIM_ADD, &g_nid); }
+void AddTrayIcon(HWND h) {
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(NOTIFYICONDATA);
+    g_nid.uVersion = NOTIFYICON_VERSION_4; // Используем версию 4 для Win 10+
+    g_nid.hWnd = h;
+    g_nid.uID = ID_TRAY_ICON;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_GUID; // Добавляем GUID для надёжности
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    g_nid.hBalloonIcon = LoadIcon(NULL, IDI_APPLICATION);
+    _tcscpy_s(g_nid.szTip, _T("Tray App - Service Manager"));
+
+    // Уникальный GUID для иконки
+    static const GUID TrayIconGuid =
+    { 0x12345678, 0x1234, 0x1234, { 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 } };
+    g_nid.guidItem = TrayIconGuid;
+
+    // Удаляем старую иконку перед добавлением новой
+    Shell_NotifyIcon(NIM_DELETE, &g_nid);
+
+    BOOL result = Shell_NotifyIcon(NIM_ADD, &g_nid);
+
+    // Устанавливаем версию
+    if (result) {
+        Shell_NotifyIcon(NIM_SETVERSION, &g_nid);
+    }
+}
+
 void RemoveTrayIcon() { Shell_NotifyIcon(NIM_DELETE, &g_nid); }
-void ShowContextMenu(HWND h) { POINT pt; GetCursorPos(&pt); HMENU m = CreatePopupMenu(); InsertMenu(m, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN, _T("Open")); InsertMenu(m, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL); InsertMenu(m, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, _T("Exit")); SetForegroundWindow(h); TrackPopupMenu(m, TPM_RIGHTALIGN, pt.x, pt.y, 0, h, NULL); PostMessage(h, WM_NULL, 0, 0); DestroyMenu(m); }
+void ShowContextMenu(HWND h) { 
+    POINT pt; 
+    GetCursorPos(&pt); 
+    HMENU m = CreatePopupMenu(); 
+    InsertMenu(m, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN, _T("Open TrayApp"));
+    InsertMenu(m, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    InsertMenu(m, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, _T("Exit (Stop Service)"));
+    SetForegroundWindow(h); 
+    TrackPopupMenu(m, TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, h, NULL); 
+    PostMessage(h, WM_NULL, 0, 0); 
+    DestroyMenu(m); 
+}
 void ShowMainWindow(HWND h) { ShowWindow(h, IsIconic(h) ? SW_RESTORE : SW_SHOW); SetForegroundWindow(h); g_bMainWindowVisible = true; }
