@@ -123,6 +123,13 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
     g_hInstance = hi;
     InitCommonControls();
 
+    HANDLE hMutex = CreateMutexW(NULL, FALSE, L"Global\\TrayApp_Session_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(hMutex);
+        return 0; // Уже запущено — выходим
+    }
+
     // Проверяем, запущены ли от сервиса
     LPWSTR* szArglist;
     int nArgs;

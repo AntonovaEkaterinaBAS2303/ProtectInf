@@ -238,6 +238,29 @@ DWORD WINAPI ServiceWorkerThread(LPVOID) {
 
 void StartAppInSession(DWORD sessionId)
 {
+    {
+        std::lock_guard<std::mutex> lock(g_ProcessMutex);
+        auto it = g_SessionProcesses.find(sessionId);
+        if (it != g_SessionProcesses.end() && !it->second.empty())
+        {
+            // Проверяем, жив ли ещё процесс
+            bool allDead = true;
+            for (HANDLE h : it->second) {
+                DWORD exitCode = 0;
+                if (GetExitCodeProcess(h, &exitCode) && exitCode == STILL_ACTIVE) {
+                    allDead = false;
+                    break;
+                }
+            }
+            if (!allDead) {
+                LogToFile((L"StartApp: App already running in session " + std::to_wstring(sessionId)).c_str());
+                return; // Уже запущено
+            }
+            // Все мёртвые — очищаем
+            it->second.clear();
+        }
+    }
+
     wchar_t buf[512];
 
     // Логируем попытку запуска
