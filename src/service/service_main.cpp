@@ -1,4 +1,4 @@
-#include <windows.h>
+п»ї#include <windows.h>
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <rpc.h>
@@ -9,6 +9,8 @@
 #include <vector>
 #include <set>
 #include <filesystem>
+#include <aclapi.h>
+#include <sddl.h>
 
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
@@ -39,12 +41,103 @@ std::map<DWORD, std::vector<HANDLE>> g_SessionProcesses;
 std::mutex g_ProcessMutex;
 std::wstring g_ServiceDirectory;
 
+BOOL CALLBACK SecureStopPrompt()
+{
+    DWORD activeSession = WTSGetActiveConsoleSessionId();
+    if (activeSession == 0xFFFFFFFF) return FALSE;
+
+    // Р—Р°РїСѓСЃРєР°РµРј MessageBox РЅР° Secure Desktop Р°РєС‚РёРІРЅРѕР№ СЃРµСЃСЃРёРё
+    DWORD result = 0;
+    WTSSendMessageW(
+        WTS_CURRENT_SERVER_HANDLE,
+        activeSession,
+        (LPWSTR)L"TrayApp Service - Stop Confirmation",
+        (DWORD)wcslen(L"TrayApp Service - Stop Confirmation") * sizeof(wchar_t),
+        (LPWSTR)L"Are you sure you want to stop the TrayApp Service?\n\nThis will close all TrayApp applications.",
+        (DWORD)wcslen(L"Are you sure you want to stop the TrayApp Service?\n\nThis will close all TrayApp applications.") * sizeof(wchar_t),
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        30, // РўР°Р№РјР°СѓС‚ 30 СЃРµРєСѓРЅРґ
+        &result,
+        TRUE // РћР¶РёРґР°С‚СЊ РѕС‚РІРµС‚
+    );
+
+    return (result == IDYES);
+}
+
+bool ProtectProcessFromAll(HANDLE hProcess)
+{
+    PSID pSystemSid = NULL;
+    PSID pAdminSid = NULL;
+    PSID pEveryoneSid = NULL;
+    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+    SID_IDENTIFIER_AUTHORITY WorldAuthority = SECURITY_WORLD_SID_AUTHORITY;
+
+    AllocateAndInitializeSid(&NtAuthority, 1, SECURITY_LOCAL_SYSTEM_RID,
+        0, 0, 0, 0, 0, 0, 0, &pSystemSid);
+    AllocateAndInitializeSid(&NtAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &pAdminSid);
+    AllocateAndInitializeSid(&WorldAuthority, 1, SECURITY_WORLD_RID,
+        0, 0, 0, 0, 0, 0, 0, &pEveryoneSid);
+
+    EXPLICIT_ACCESSW ea[3] = {};
+
+    // SYSTEM - РїРѕР»РЅС‹Р№ РґРѕСЃС‚СѓРї
+    ea[0].grfAccessPermissions = PROCESS_ALL_ACCESS;
+    ea[0].grfAccessMode = SET_ACCESS;
+    ea[0].grfInheritance = NO_INHERITANCE;
+    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea[0].Trustee.ptstrName = (LPWSTR)pSystemSid;
+
+    // РђРґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂС‹ - Р—РђРџР Р•Рў РЅР° Р·Р°РІРµСЂС€РµРЅРёРµ
+    ea[1].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+    ea[1].grfAccessMode = DENY_ACCESS;
+    ea[1].grfInheritance = NO_INHERITANCE;
+    ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    ea[1].Trustee.ptstrName = (LPWSTR)pAdminSid;
+
+    // Р’СЃРµ РѕСЃС‚Р°Р»СЊРЅС‹Рµ - Р—РђРџР Р•Рў РЅР° Р·Р°РІРµСЂС€РµРЅРёРµ
+    ea[2].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_READ | PROCESS_VM_WRITE;
+    ea[2].grfAccessMode = DENY_ACCESS;
+    ea[2].grfInheritance = NO_INHERITANCE;
+    ea[2].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[2].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea[2].Trustee.ptstrName = (LPWSTR)pEveryoneSid;
+
+    PACL pACL = NULL;
+    DWORD dwResult = SetEntriesInAclW(3, ea, NULL, &pACL);
+
+    if (dwResult == ERROR_SUCCESS) {
+        dwResult = SetSecurityInfo(hProcess, SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            NULL, NULL, pACL, NULL);
+        LocalFree(pACL);
+    }
+
+    FreeSid(pSystemSid);
+    FreeSid(pAdminSid);
+    FreeSid(pEveryoneSid);
+    return (dwResult == ERROR_SUCCESS);
+}
+
 // RPC Interface Implementation
 void StopService(handle_t h)
 {
     (void)h;
     LogToFile(L"RPC: StopService called by client");
-    if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
+
+    // Р—Р°РїСЂР°С€РёРІР°РµРј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РЅР° Secure Desktop
+    if (SecureStopPrompt())
+    {
+        LogToFile(L"RPC: User confirmed stop - shutting down");
+        if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
+    }
+    else
+    {
+        LogToFile(L"RPC: User declined stop");
+    }
 }
 
 long GetStatus(handle_t h)
@@ -99,6 +192,11 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 
     g_ServiceStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    // Р—Р°С‰РёС‚Р° РїСЂРѕС†РµСЃСЃР° СЃР»СѓР¶Р±С‹
+    ProtectProcessFromAll(GetCurrentProcess());
+    LogToFile(L"ServiceMain: Process DACL protected (admins denied)");
+
     if (!g_ServiceStopEvent)
     {
         g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
@@ -141,7 +239,7 @@ VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode)
     {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
-        // Игнорируем — служба останавливается только через RPC
+        // РРіРЅРѕСЂРёСЂСѓРµРј вЂ” СЃР»СѓР¶Р±Р° РѕСЃС‚Р°РЅР°РІР»РёРІР°РµС‚СЃСЏ С‚РѕР»СЊРєРѕ С‡РµСЂРµР· RPC
         LogToFile(L"CtrlHandler: STOP/SHUTDOWN signal IGNORED");
         break;
     case SERVICE_CONTROL_SESSIONCHANGE:
@@ -172,7 +270,7 @@ DWORD WINAPI ServiceWorkerThread(LPVOID) {
     WTS_SESSION_INFO* p = NULL;
     DWORD n = 0;
 
-    // Первый проход - запускаем в существующих активных сессиях
+    // РџРµСЂРІС‹Р№ РїСЂРѕС…РѕРґ - Р·Р°РїСѓСЃРєР°РµРј РІ СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёС… Р°РєС‚РёРІРЅС‹С… СЃРµСЃСЃРёСЏС…
     if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &p, &n)) {
         wchar_t buf[256];
         wsprintf(buf, L"ServiceWorkerThread: Found %d sessions", n);
@@ -187,7 +285,7 @@ DWORD WINAPI ServiceWorkerThread(LPVOID) {
 
             known.insert(p[i].SessionId);
 
-            // Запускаем для активных И подключенных сессий
+            // Р—Р°РїСѓСЃРєР°РµРј РґР»СЏ Р°РєС‚РёРІРЅС‹С… Р РїРѕРґРєР»СЋС‡РµРЅРЅС‹С… СЃРµСЃСЃРёР№
             if (p[i].State == WTSActive || p[i].State == WTSConnected || p[i].State == WTSDisconnected) {
                 LogToFile(L"ServiceWorkerThread: Starting app in session");
                 StartAppInSession(p[i].SessionId);
@@ -206,7 +304,7 @@ DWORD WINAPI ServiceWorkerThread(LPVOID) {
             for (DWORD i = 0; i < ns; i++) {
                 if (ps[i].SessionId == 0) continue;
 
-                // Новая сессия
+                // РќРѕРІР°СЏ СЃРµСЃСЃРёСЏ
                 if (!known.count(ps[i].SessionId)) {
                     wchar_t buf[256];
                     wsprintf(buf, L"ServiceWorkerThread: NEW session! ID=%d, State=%d",
@@ -220,7 +318,7 @@ DWORD WINAPI ServiceWorkerThread(LPVOID) {
                         StartAppInSession(ps[i].SessionId);
                     }
                 }
-                // Существующая сессия, но изменилось состояние
+                // РЎСѓС‰РµСЃС‚РІСѓСЋС‰Р°СЏ СЃРµСЃСЃРёСЏ, РЅРѕ РёР·РјРµРЅРёР»РѕСЃСЊ СЃРѕСЃС‚РѕСЏРЅРёРµ
                 else if (ps[i].State == WTSActive && !g_SessionProcesses.count(ps[i].SessionId)) {
                     wchar_t buf[256];
                     wsprintf(buf, L"ServiceWorkerThread: Session %d became active, starting app", ps[i].SessionId);
@@ -243,7 +341,7 @@ void StartAppInSession(DWORD sessionId)
         auto it = g_SessionProcesses.find(sessionId);
         if (it != g_SessionProcesses.end() && !it->second.empty())
         {
-            // Проверяем, жив ли ещё процесс
+            // РџСЂРѕРІРµСЂСЏРµРј, Р¶РёРІ Р»Рё РµС‰С‘ РїСЂРѕС†РµСЃСЃ
             bool allDead = true;
             for (HANDLE h : it->second) {
                 DWORD exitCode = 0;
@@ -254,16 +352,16 @@ void StartAppInSession(DWORD sessionId)
             }
             if (!allDead) {
                 LogToFile((L"StartApp: App already running in session " + std::to_wstring(sessionId)).c_str());
-                return; // Уже запущено
+                return; // РЈР¶Рµ Р·Р°РїСѓС‰РµРЅРѕ
             }
-            // Все мёртвые — очищаем
+            // Р’СЃРµ РјС‘СЂС‚РІС‹Рµ вЂ” РѕС‡РёС‰Р°РµРј
             it->second.clear();
         }
     }
 
     wchar_t buf[512];
 
-    // Логируем попытку запуска
+    // Р›РѕРіРёСЂСѓРµРј РїРѕРїС‹С‚РєСѓ Р·Р°РїСѓСЃРєР°
     wsprintf(buf, L"StartAppInSession: Trying to start app for session %d", sessionId);
     LogToFile(buf);
 
@@ -297,14 +395,13 @@ void StartAppInSession(DWORD sessionId)
     if (CreateProcessAsUser(hDup, NULL, (LPWSTR)cmdLine.c_str(), NULL, NULL, FALSE,
         CREATE_UNICODE_ENVIRONMENT, env, NULL, &si, &pi))
     {
-        LogToFile((L"StartApp: SUCCESS PID=" + std::to_wstring(pi.dwProcessId)).c_str());
+        // Р—Р°С‰РёС‚Р° РѕС‚ Р’РЎР•РҐ, РІРєР»СЋС‡Р°СЏ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂРѕРІ
+        ProtectProcessFromAll(pi.hProcess);
+
+        LogToFile((L"StartApp: SUCCESS PID=" + std::to_wstring(pi.dwProcessId) + L" (protected)").c_str());
         std::lock_guard<std::mutex> lock(g_ProcessMutex);
         g_SessionProcesses[sessionId].push_back(pi.hProcess);
         CloseHandle(pi.hThread);
-    }
-    else
-    {
-        LogToFile((L"StartApp: FAILED error=" + std::to_wstring(GetLastError())).c_str());
     }
 
     if (env) DestroyEnvironmentBlock(env);
@@ -319,7 +416,7 @@ void StopAllApps()
     for (auto& pair : g_SessionProcesses) {
         for (HANDLE h : pair.second) {
             DWORD pid = GetProcessId(h);
-            // Сначала пробуем мягкое завершение
+            // РЎРЅР°С‡Р°Р»Р° РїСЂРѕР±СѓРµРј РјСЏРіРєРѕРµ Р·Р°РІРµСЂС€РµРЅРёРµ
             EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
                 DWORD wndPid = 0;
                 GetWindowThreadProcessId(hwnd, &wndPid);
