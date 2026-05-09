@@ -10,7 +10,9 @@ interface ServiceControl
     void Shutdown([in] handle_t hBinding);
     long GetUserInfo([in] handle_t hBinding, [out, string] wchar_t** username);
     long Login([in] handle_t hBinding, [in, string] const wchar_t* username, [in, string] const wchar_t* password);
-    long Logout([in] handle_t hBinding);
+    long Logout(
+        [in] handle_t IDL_handle
+    );
     long GetLicenseInfo([in] handle_t hBinding, [out] long* daysRemaining, [out, string] wchar_t** expiryDate);
     long ActivateProduct([in] handle_t hBinding, [in, string] const wchar_t* activationKey);
 }
