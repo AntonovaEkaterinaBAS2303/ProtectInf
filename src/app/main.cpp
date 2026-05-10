@@ -5,6 +5,7 @@
 #include <tlhelp32.h>
 #include <string>
 #include <rpc.h>
+#include <stdlib.h> 
 #include "../common/service_rpc.h"
 
 #pragma comment(lib, "rpcrt4.lib")
@@ -33,6 +34,18 @@
 
 #define WM_UPDATE_UI (WM_APP + 2)
 #define WM_LICENSE_CHANGED (WM_APP + 3)
+
+extern "C" {
+    void* __RPC_USER MIDL_user_allocate(size_t size)
+    {
+        return malloc(size);
+    }
+
+    void __RPC_USER MIDL_user_free(void* p)
+    {
+        free(p);
+    }
+}
 
 HINSTANCE g_hInstance = NULL;
 HWND g_hWnd = NULL;
@@ -73,29 +86,37 @@ void OnLogin();
 void OnLogout();
 void OnActivate();
 
-// RPC wrapper functions that don't have C++ objects with destructors
+// CRITICAL FIX: Safe RPC wrapper functions
 static long RpcLoginSafe(handle_t binding, const wchar_t* username, const wchar_t* password)
 {
-    long result = 0;
+    long result = 1;
     RpcTryExcept
+    {
         result = Login(binding, username, password);
-    RpcExcept(1)
-        result = 0;
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+    }
     RpcEndExcept
         return result;
 }
 
 static long RpcGetLicenseInfoSafe(handle_t binding, long* daysRemaining, wchar_t** expiryDate)
 {
-    long result = 0;
-    RpcTryExcept
-        result = GetLicenseInfo(binding, daysRemaining, expiryDate);
-    RpcExcept(1)
-        result = 1;
+    long result = 1;
     if (daysRemaining) *daysRemaining = 0;
-    if (expiryDate) {
-        *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
-        if (*expiryDate) wcscpy_s(*expiryDate, 16, L"Error");
+    if (expiryDate) *expiryDate = NULL;
+
+    RpcTryExcept
+    {
+        result = GetLicenseInfo(binding, daysRemaining, expiryDate);
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+        if (daysRemaining) *daysRemaining = 0;
+        if (expiryDate) *expiryDate = NULL;
     }
     RpcEndExcept
         return result;
@@ -103,30 +124,48 @@ static long RpcGetLicenseInfoSafe(handle_t binding, long* daysRemaining, wchar_t
 
 static long RpcGetUserInfoSafe(handle_t binding, wchar_t** username)
 {
-    long result = 0;
+    long result = 1;
+    if (username) *username = NULL;
+
     RpcTryExcept
+    {
         result = GetUserInfo(binding, username);
-    RpcExcept(1)
-        result = 0;
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+        if (username) *username = NULL;
+    }
     RpcEndExcept
         return result;
 }
 
-static void RpcLogoutSafe(handle_t binding)
+static long RpcLogoutSafe(handle_t binding)
 {
+    long result = 1;
     RpcTryExcept
-        Logout(binding);
-    RpcExcept(1)
-        RpcEndExcept
+    {
+        result = Logout(binding);
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+    }
+    RpcEndExcept
+        return result;
 }
 
 static long RpcActivateProductSafe(handle_t binding, const wchar_t* activationKey)
 {
-    long result = 0;
+    long result = 1;
     RpcTryExcept
+    {
         result = ActivateProduct(binding, activationKey);
-    RpcExcept(1)
-        result = 0;
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+    }
     RpcEndExcept
         return result;
 }
@@ -134,9 +173,12 @@ static long RpcActivateProductSafe(handle_t binding, const wchar_t* activationKe
 static void RpcStopServiceSafe(handle_t binding)
 {
     RpcTryExcept
-        StopService(binding);
-    RpcExcept(1)
     {
+        StopService(binding);
+    }
+        RpcExcept(1)
+    {
+        // Fallback: try to stop via SCM
         SC_HANDLE hSCM = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
         if (hSCM) {
             SC_HANDLE hSvc = OpenService(hSCM, SERVICE_NAME, SERVICE_STOP);
@@ -206,8 +248,8 @@ bool InitRpcBinding() {
 }
 
 void CleanupRpcBinding() {
-    if (g_hRpcBinding) RpcBindingFree(&g_hRpcBinding);
-    if (g_StringBinding) RpcStringFreeW(&g_StringBinding);
+    if (g_hRpcBinding) { RpcBindingFree(&g_hRpcBinding); g_hRpcBinding = NULL; }
+    if (g_StringBinding) { RpcStringFreeW(&g_StringBinding); g_StringBinding = NULL; }
 }
 
 void StopWindowsService()
@@ -281,7 +323,6 @@ void UpdateUIState() {
             EnableWindow(g_hActivationKeyEdit, FALSE);
             EnableWindow(g_hActivateButton, FALSE);
 
-            // Показываем дату истечения лицензии
             wchar_t licenseText[256];
             wsprintfW(licenseText, L"License Status: Active (Expires: %s, %d days left)",
                 g_ExpiryDate, g_DaysRemaining);
@@ -296,10 +337,11 @@ void OnLogin() {
     GetWindowTextW(g_hUsernameEdit, username, 256);
     GetWindowTextW(g_hPasswordEdit, password, 256);
 
-    if (!g_hRpcBinding) InitRpcBinding();
     if (!g_hRpcBinding) {
-        MessageBoxW(g_hWnd, L"Failed to connect to service", L"Error", MB_OK | MB_ICONERROR);
-        return;
+        if (!InitRpcBinding()) {
+            MessageBoxW(g_hWnd, L"Failed to connect to service", L"Error", MB_OK | MB_ICONERROR);
+            return;
+        }
     }
 
     long result = RpcLoginSafe(g_hRpcBinding, username, password);
@@ -308,7 +350,7 @@ void OnLogin() {
         g_bAuthenticated = true;
         wcscpy_s(g_Username, username);
 
-        // Проверяем статус лицензии
+        // Check license status
         long daysRemaining = 0;
         wchar_t* expiryDateStr = NULL;
         long licResult = RpcGetLicenseInfoSafe(g_hRpcBinding, &daysRemaining, &expiryDateStr);
@@ -335,8 +377,9 @@ void OnLogin() {
 }
 
 void OnLogout() {
-    if (!g_hRpcBinding) InitRpcBinding();
-    if (!g_hRpcBinding) return;
+    if (!g_hRpcBinding) {
+        if (!InitRpcBinding()) return;
+    }
 
     RpcLogoutSafe(g_hRpcBinding);
 
@@ -354,13 +397,14 @@ void OnActivate() {
     wchar_t activationKey[256];
     GetWindowTextW(g_hActivationKeyEdit, activationKey, 256);
 
-    if (!g_hRpcBinding) InitRpcBinding();
-    if (!g_hRpcBinding) return;
+    if (!g_hRpcBinding) {
+        if (!InitRpcBinding()) return;
+    }
 
     long result = RpcActivateProductSafe(g_hRpcBinding, activationKey);
 
     if (result == 0) {
-        // После активации проверяем статус лицензии
+        // Check new license status after activation
         long daysRemaining = 0;
         wchar_t* expiryDateStr = NULL;
         long licResult = RpcGetLicenseInfoSafe(g_hRpcBinding, &daysRemaining, &expiryDateStr);
@@ -386,7 +430,6 @@ void OnActivate() {
     }
 }
 
-// Forward declaration of WndProc before _tWinMain
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
 int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
@@ -459,7 +502,7 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
 
     CreateUIControls(g_hWnd);
 
-    // Проверяем начальное состояние аутентификации
+    // Initialize RPC and check initial state
     if (InitRpcBinding()) {
         wchar_t* username = NULL;
         long result = RpcGetUserInfoSafe(g_hRpcBinding, &username);
@@ -468,7 +511,7 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
             g_bAuthenticated = true;
             wcscpy_s(g_Username, username);
 
-            // Проверяем лицензию
+            // Check license
             long daysRemaining = 0;
             wchar_t* expiryDateStr = NULL;
             long licResult = RpcGetLicenseInfoSafe(g_hRpcBinding, &daysRemaining, &expiryDateStr);
@@ -492,7 +535,7 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
     AddTrayIcon(g_hWnd);
     g_bMainWindowVisible = false;
 
-    // Запускаем таймер для периодической проверки лицензии
+    // Timer for periodic license check
     SetTimer(g_hWnd, 1, 30000, NULL);
 
     MSG msg;
@@ -513,13 +556,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             wchar_t* expiryDateStr = NULL;
             long result = RpcGetLicenseInfoSafe(g_hRpcBinding, &daysRemaining, &expiryDateStr);
 
-            if (result == 0) {
+            if (result == 0 && expiryDateStr) {
                 if (!g_bLicensed || daysRemaining != g_DaysRemaining) {
                     g_bLicensed = true;
                     g_DaysRemaining = daysRemaining;
-                    if (expiryDateStr) {
-                        wcscpy_s(g_ExpiryDate, expiryDateStr);
-                    }
+                    wcscpy_s(g_ExpiryDate, expiryDateStr);
                     UpdateUIState();
                 }
             }

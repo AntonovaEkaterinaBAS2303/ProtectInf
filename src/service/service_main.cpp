@@ -18,6 +18,7 @@
 #include <sstream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <stdlib.h>
 
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
@@ -25,8 +26,6 @@
 #pragma comment(lib, "winhttp.lib")
 
 #include "../common/service_rpc.h"
-
-using json = nlohmann::json;
 
 #define SERVICE_NAME L"TrayAppService"
 #define AUTH_ENDPOINT L"/auth/login"
@@ -39,6 +38,18 @@ using json = nlohmann::json;
 #define API_USE_HTTPS true
 #define PRODUCT_ID L"123e4567-e89b-12d3-a456-426614174000"
 #define DEVICE_MAC L"E0:75:C3:FC:07:5C"
+
+extern "C" {
+    void* __RPC_USER MIDL_user_allocate(size_t size)
+    {
+        return malloc(size);
+    }
+
+    void __RPC_USER MIDL_user_free(void* p)
+    {
+        free(p);
+    }
+}
 
 void LogToFile(const wchar_t* msg)
 {
@@ -56,7 +67,6 @@ void LogToFile(const wchar_t* msg)
     }
 }
 
-// Authentication and License State
 struct AuthTokens {
     std::wstring accessToken, refreshToken;
     std::chrono::system_clock::time_point accessExpiry, refreshExpiry;
@@ -75,7 +85,6 @@ std::map<DWORD, std::vector<HANDLE>> g_SessionProcesses;
 std::mutex g_ProcessMutex;
 std::wstring g_ServiceDirectory;
 
-// Authentication and License globals
 std::mutex g_AuthMutex, g_LicenseMutex;
 std::unique_ptr<AuthTokens> g_AuthTokens;
 std::unique_ptr<LicenseInfo> g_LicenseInfo;
@@ -83,7 +92,6 @@ std::wstring g_AuthenticatedUser;
 HANDLE g_hRefreshThread = NULL, g_hLicenseRefreshThread = NULL;
 bool g_bStopRefreshThreads = false;
 
-// Forward declarations
 bool PerformLogin(const std::wstring& u, const std::wstring& p);
 bool RefreshTokens();
 bool RequestLicenseStatus();
@@ -138,14 +146,11 @@ std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& ex
     int y = 0, m = 0, d = 0, h = 23, min = 59, s = 59;
     int parsed;
 
-    // Try ISO format: 2027-04-27T23:59:59
     parsed = swscanf_s(expDate.c_str(), L"%d-%d-%dT%d:%d:%d", &y, &m, &d, &h, &min, &s);
     if (parsed < 3) {
-        // Try: 2027-04-27 23:59:59
         parsed = swscanf_s(expDate.c_str(), L"%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &min, &s);
     }
     if (parsed < 3) {
-        // Try: 2027-04-27
         parsed = swscanf_s(expDate.c_str(), L"%d-%d-%d", &y, &m, &d);
         h = 23; min = 59; s = 59;
     }
@@ -186,7 +191,6 @@ std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& ex
 class HttpClient {
     HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
     std::wstring host; int port; bool useHttps;
-    bool responseReceived = false;  // Флаг, что ответ уже получен
 
 public:
     HttpClient(const std::wstring& s, int p = 8080, bool https = false) : host(s), port(p), useHttps(https) {
@@ -219,7 +223,6 @@ public:
 
     bool SendRequest(const std::wstring& method, const std::wstring& path,
         const std::wstring& body = L"", const std::wstring& auth = L"") {
-        responseReceived = false;
 
         DWORD flags = useHttps ? WINHTTP_FLAG_SECURE : 0;
         hRequest = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(),
@@ -232,17 +235,15 @@ public:
             return false;
         }
 
-        // Установка опций безопасности для HTTPS
+        // Устанавливаем опции безопасности ТОЛЬКО через WinHttpSetOption,
+        // используя правильные константы SECURITY_FLAG_
         if (useHttps) {
-            DWORD sf = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+            DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                 SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
                 SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                 SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
-
-            // Установка TLS 1.2
-            DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+                &securityFlags, sizeof(securityFlags));
         }
 
         // Заголовки
@@ -254,10 +255,12 @@ public:
         // Конвертация тела в UTF-8
         std::string u8body;
         if (!body.empty()) {
-            int l = WideCharToMultiByte(CP_UTF8, 0, body.c_str(), (int)body.length(), NULL, 0, NULL, NULL);
+            int l = WideCharToMultiByte(CP_UTF8, 0, body.c_str(),
+                (int)body.length(), NULL, 0, NULL, NULL);
             if (l > 0) {
                 u8body.resize(l);
-                WideCharToMultiByte(CP_UTF8, 0, body.c_str(), (int)body.length(), &u8body[0], l, NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, body.c_str(),
+                    (int)body.length(), &u8body[0], l, NULL, NULL);
             }
         }
 
@@ -266,19 +269,23 @@ public:
 
         LogToFile((L"HttpClient: Sending " + method + L" " + path).c_str());
 
-        BOOL sendResult = WinHttpSendRequest(hRequest, hdrs.c_str(), (DWORD)hdrs.length(),
-            (LPVOID)bp, bl, bl, 0);
-
-        if (!sendResult) {
+        if (!WinHttpSendRequest(hRequest, hdrs.c_str(), (DWORD)hdrs.length(),
+            (LPVOID)bp, bl, bl, 0))
+        {
             wchar_t buf[128];
             wsprintf(buf, L"HttpClient: WinHttpSendRequest failed, error=%d", GetLastError());
             LogToFile(buf);
             return false;
         }
 
-        return WinHttpSendRequest(hRequest, hdrs.c_str(), (DWORD)hdrs.length(), (LPVOID)bp, bl, bl, 0) && WinHttpReceiveResponse(hRequest, NULL);
+        if (!WinHttpReceiveResponse(hRequest, NULL))
+        {
+            wchar_t buf[128];
+            wsprintf(buf, L"HttpClient: WinHttpReceiveResponse failed, error=%d", GetLastError());
+            LogToFile(buf);
+            return false;
+        }
 
-        responseReceived = true;
         LogToFile(L"HttpClient: Request sent and response received");
         return true;
     }
@@ -288,7 +295,8 @@ public:
         DWORD s = 0, d = 0;
         do {
             s = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &s) || !s) break;
+            if (!WinHttpQueryDataAvailable(hRequest, &s)) break;
+            if (s == 0) break;
             std::vector<char> b(s + 1);
             if (!WinHttpReadData(hRequest, b.data(), s, &d)) break;
             if (d == 0) break;
@@ -304,26 +312,15 @@ public:
     }
 
     DWORD GetStatusCode() {
-        // Сначала пробуем текстовый формат
-        wchar_t statusText[16] = { 0 };
-        DWORD size = sizeof(statusText);
-        BOOL result = WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE,
-            WINHTTP_HEADER_NAME_BY_INDEX, statusText, &size, WINHTTP_NO_HEADER_INDEX);
-        if (result) return _wtoi(statusText);
-
-        // Потом пробуем числовой
-        DWORD sc = 0; size = sizeof(sc);
-        result = WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        DWORD sc = 0;
+        DWORD size = sizeof(sc);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &sc, &size, WINHTTP_NO_HEADER_INDEX);
-        if (result) return sc;
-
-        return 0;
+        return sc;
     }
-    
 };
-// Authentication Functions
-bool PerformLogin(const std::wstring& u, const std::wstring& p) {
 
+bool PerformLogin(const std::wstring& u, const std::wstring& p) {
     LogToFile(L"PerformLogin: Starting login...");
 
     if (u.empty() || p.empty()) {
@@ -343,9 +340,6 @@ bool PerformLogin(const std::wstring& u, const std::wstring& p) {
 
     if (!c.SendRequest(L"POST", AUTH_ENDPOINT, body)) {
         LogToFile(L"PerformLogin: Request failed");
-        wchar_t buf[64];
-        wsprintf(buf, L"PerformLogin: HTTP status = %d", c.GetStatusCode());
-        LogToFile(buf);
         return false;
     }
 
@@ -436,7 +430,6 @@ bool RequestLicenseStatus() {
 
     std::wstring r = client.GetResponse();
 
-    // Check if license exists
     if (r.find(L"\"ticketSignature\"") != std::wstring::npos ||
         r.find(L"\"licenseCode\"") != std::wstring::npos) {
 
@@ -559,7 +552,6 @@ bool ActivateLicense(const std::wstring& code) {
     return false;
 }
 
-// Token refresh thread
 DWORD WINAPI TokenRefreshThread(LPVOID) {
     LogToFile(L"TokenRefreshThread: Started");
     while (!g_bStopRefreshThreads) {
@@ -590,7 +582,7 @@ DWORD WINAPI LicenseRefreshThread(LPVOID) {
 
     while (!g_bStopRefreshThreads) {
         Sleep(60000);
-        if (g_bStopRefreshThreads) break;  // Проверяем флаг перед выполнением
+        if (g_bStopRefreshThreads) break;
 
         bool needCheck = false;
         {
@@ -635,24 +627,26 @@ BOOL CALLBACK SecureStopPrompt()
     return (result == IDYES);
 }
 
-bool ProtectProcessFromAll(HANDLE hProcess)
+bool ProtectProcessFromAdmins(HANDLE hProcess)
 {
     PSID pSystemSid = NULL;
     PSID pAdminSid = NULL;
-    // Убираем Everyone для ясности, но можно оставить с осторожностью
-    // PSID pEveryoneSid = NULL; 
     SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
 
-    AllocateAndInitializeSid(&NtAuthority, 1, SECURITY_LOCAL_SYSTEM_RID,
-        0, 0, 0, 0, 0, 0, 0, &pSystemSid);
-    AllocateAndInitializeSid(&NtAuthority, 2,
-        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
-        0, 0, 0, 0, 0, 0, &pAdminSid);
+    if (!AllocateAndInitializeSid(&NtAuthority, 1, SECURITY_LOCAL_SYSTEM_RID,
+        0, 0, 0, 0, 0, 0, 0, &pSystemSid))
+        return false;
 
-    // Массив ACE теперь состоит из 2 элементов
+    if (!AllocateAndInitializeSid(&NtAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &pAdminSid))
+    {
+        FreeSid(pSystemSid);
+        return false;
+    }
+
     EXPLICIT_ACCESSW ea[2] = {};
 
-    // 1. SYSTEM - ПОЛНЫЙ ДОСТУП
     ea[0].grfAccessPermissions = PROCESS_ALL_ACCESS;
     ea[0].grfAccessMode = SET_ACCESS;
     ea[0].grfInheritance = NO_INHERITANCE;
@@ -660,30 +654,21 @@ bool ProtectProcessFromAll(HANDLE hProcess)
     ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
     ea[0].Trustee.ptstrName = (LPWSTR)pSystemSid;
 
-    // 2. Administrators - ЗАПРЕТ на запись/терминацию
-    ea[1].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+    ea[1].grfAccessPermissions = PROCESS_TERMINATE;
     ea[1].grfAccessMode = DENY_ACCESS;
     ea[1].grfInheritance = NO_INHERITANCE;
     ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
     ea[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
     ea[1].Trustee.ptstrName = (LPWSTR)pAdminSid;
 
-    // ЗАПРЕТ ДЛЯ Everyone УБРАН - он ломал CreateProcessAsUser
-
     PACL pACL = NULL;
     DWORD dwResult = SetEntriesInAclW(2, ea, NULL, &pACL);
 
-    if (dwResult == ERROR_SUCCESS) {
+    if (dwResult == ERROR_SUCCESS && pACL) {
         dwResult = SetSecurityInfo(hProcess, SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             NULL, NULL, pACL, NULL);
         LocalFree(pACL);
-    }
-    else {
-        // Обработка ошибки SetEntriesInAclW
-        wchar_t buf[128];
-        wsprintf(buf, L"SetEntriesInAclW failed with error %d", dwResult);
-        LogToFile(buf);
     }
 
     FreeSid(pSystemSid);
@@ -691,7 +676,6 @@ bool ProtectProcessFromAll(HANDLE hProcess)
     return (dwResult == ERROR_SUCCESS);
 }
 
-// RPC Interface Implementation
 void StopService(handle_t h)
 {
     (void)h;
@@ -739,32 +723,30 @@ long GetUserInfo(handle_t h, wchar_t** u) {
     std::lock_guard<std::mutex> l(g_AuthMutex);
     if (!g_AuthTokens || g_AuthenticatedUser.empty()) {
         *u = (wchar_t*)MIDL_user_allocate(8 * sizeof(wchar_t));
-        wcscpy_s(*u, 8, L"Unknown");
+        if (*u) wcscpy_s(*u, 8, L"Unknown");
         return 1;
     }
-    *u = (wchar_t*)MIDL_user_allocate((g_AuthenticatedUser.length() + 1) * sizeof(wchar_t));
-    wcscpy_s(*u, g_AuthenticatedUser.length() + 1, g_AuthenticatedUser.c_str());
+    size_t len = g_AuthenticatedUser.length() + 1;
+    *u = (wchar_t*)MIDL_user_allocate(len * sizeof(wchar_t));
+    if (*u) wcscpy_s(*u, len, g_AuthenticatedUser.c_str());
     return 0;
 }
 
 long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
     (void)h;
 
-    // Не вызываем RequestLicenseStatus если нет токена
+    if (!daysRemaining || !expiryDate) return 1;
+
     {
         std::lock_guard<std::mutex> lock(g_AuthMutex);
         if (g_AuthTokens && !g_AuthenticatedUser.empty()) {
-            // Разблокируем мьютекс перед вызовом RequestLicenseStatus
-            // чтобы избежать дедлока
         }
         else {
-            // Нет токена - возвращаем данные из кеша
             std::lock_guard<std::mutex> ll(g_LicenseMutex);
             if (g_LicenseInfo && g_LicenseInfo->active) {
                 auto now = std::chrono::system_clock::now();
                 auto duration = std::chrono::duration_cast<std::chrono::hours>(
-                    g_LicenseInfo->expiryDate - now
-                );
+                    g_LicenseInfo->expiryDate - now);
                 long days = (long)(duration.count() / 24);
 
                 if (days > 0) {
@@ -776,19 +758,18 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
                     wss << std::put_time(&stm, L"%Y-%m-%d");
                     std::wstring dateStr = wss.str();
                     *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * (dateStr.length() + 1));
-                    wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
+                    if (*expiryDate) wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
                     return 0;
                 }
             }
 
             *daysRemaining = 0;
             *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
-            wcscpy_s(*expiryDate, 16, L"No License");
+            if (*expiryDate) wcscpy_s(*expiryDate, 16, L"No License");
             return 1;
         }
     }
 
-    // Если есть токен - проверяем на сервере
     LogToFile(L"GetLicenseInfo: Checking server for current status...");
     RequestLicenseStatus();
 
@@ -796,20 +777,18 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
     if (g_LicenseInfo && g_LicenseInfo->active) {
         auto now = std::chrono::system_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::hours>(
-            g_LicenseInfo->expiryDate - now
-        );
+            g_LicenseInfo->expiryDate - now);
         long days = (long)(duration.count() / 24);
 
         if (days <= 0) {
             g_LicenseInfo->active = false;
             *daysRemaining = 0;
             *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
-            wcscpy_s(*expiryDate, 16, L"Expired");
+            if (*expiryDate) wcscpy_s(*expiryDate, 16, L"Expired");
             return 1;
         }
 
         *daysRemaining = days;
-
         time_t expiry = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
         struct tm stm;
         localtime_s(&stm, &expiry);
@@ -819,14 +798,13 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
         std::wstring dateStr = wss.str();
 
         *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * (dateStr.length() + 1));
-        wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
-
+        if (*expiryDate) wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
         return 0;
     }
 
     *daysRemaining = 0;
     *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
-    wcscpy_s(*expiryDate, 16, L"No License");
+    if (*expiryDate) wcscpy_s(*expiryDate, 16, L"No License");
     return 1;
 }
 
@@ -836,17 +814,14 @@ long ActivateProduct(handle_t h, const wchar_t* activationKey)
     return ActivateLicense(activationKey) ? 0 : 1;
 }
 
-// RPC Server Thread
 DWORD WINAPI RpcServerThreadStub(LPVOID lpParam) {
     RPC_STATUS s = RpcServerUseProtseqEpW((RPC_WSTR)L"ncalrpc", RPC_C_PROTSEQ_MAX_REQS_DEFAULT, (RPC_WSTR)L"TrayAppServiceRPC", NULL);
     if (s == RPC_S_OK || s == RPC_S_DUPLICATE_ENDPOINT) {
         s = RpcServerRegisterIf(ServiceControl_v1_0_s_ifspec, NULL, NULL);
         if (s == RPC_S_OK) {
-            // RpcServerListen блокирует поток до остановки
             RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, FALSE);
         }
     }
-    // Если RPC сервер остановлен - сигнализируем основному потоку
     if (g_ServiceStopEvent) SetEvent(g_ServiceStopEvent);
     return 0;
 }
@@ -895,18 +870,6 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
     wsprintf(buf, L"ServiceMain: Running as user, session=%d", WTSGetActiveConsoleSessionId());
     LogToFile(buf);
 
-    // Тестовый запрос для проверки соединения
-    LogToFile(L"ServiceMain: Testing HTTP connection...");
-    {
-        HttpClient test(API_HOST, API_PORT, API_USE_HTTPS);
-        if (test.Connect()) {
-            LogToFile(L"ServiceMain: HTTP connection OK");
-        }
-        else {
-            LogToFile(L"ServiceMain: HTTP connection FAILED");
-        }
-    }
-
     g_StatusHandle = RegisterServiceCtrlHandler(SERVICE_NAME, ServiceCtrlHandler);
     if (!g_StatusHandle) {
         LogToFile(L"ERROR: RegisterServiceCtrlHandler");
@@ -933,64 +896,23 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
         return;
     }
 
-    // Защита процесса службы
-    if (!ProtectProcessFromAll(GetCurrentProcess())) {
+    if (!ProtectProcessFromAdmins(GetCurrentProcess())) {
         LogToFile(L"WARNING: Process DACL protection failed");
     }
     else {
-        LogToFile(L"ServiceMain: Process DACL protected (admins denied)");
+        LogToFile(L"ServiceMain: Process DACL protected (admins cannot terminate)");
     }
 
-    // Запускаем RPC сервер
     HANDLE hRpc = CreateThread(NULL, 0, RpcServerThreadStub, NULL, 0, NULL);
     if (!hRpc) {
         LogToFile(L"ERROR: Failed to create RPC thread");
     }
 
-    // Запускаем рабочий поток через std::thread
-    std::thread* workerThread = new std::thread([]() {
-        LogToFile(L"ServiceWorkerThread: Started");
+    HANDLE hWorkerThread = CreateThread(NULL, 0, ServiceWorkerThreadStub, NULL, 0, NULL);
+    if (!hWorkerThread) {
+        LogToFile(L"ERROR: Failed to create worker thread");
+    }
 
-        std::set<DWORD> known;
-        WTS_SESSION_INFO* p = NULL;
-        DWORD n = 0;
-
-        if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &p, &n)) {
-            for (DWORD i = 0; i < n; i++) {
-                if (p[i].SessionId == 0) continue;
-                known.insert(p[i].SessionId);
-                if (p[i].State == WTSActive || p[i].State == WTSConnected || p[i].State == WTSDisconnected) {
-                    StartAppInSession(p[i].SessionId);
-                }
-            }
-            WTSFreeMemory(p);
-        }
-
-        while (WaitForSingleObject(g_ServiceStopEvent, 5000) == WAIT_TIMEOUT) {
-            WTS_SESSION_INFO* ps = NULL;
-            DWORD ns = 0;
-
-            if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &ps, &ns)) {
-                for (DWORD i = 0; i < ns; i++) {
-                    if (ps[i].SessionId == 0) continue;
-                    if (!known.count(ps[i].SessionId)) {
-                        known.insert(ps[i].SessionId);
-                        if (ps[i].State == WTSActive || ps[i].State == WTSConnected) {
-                            StartAppInSession(ps[i].SessionId);
-                        }
-                    }
-                    else if (ps[i].State == WTSActive && !g_SessionProcesses.count(ps[i].SessionId)) {
-                        StartAppInSession(ps[i].SessionId);
-                    }
-                }
-                WTSFreeMemory(ps);
-            }
-        }
-
-        LogToFile(L"ServiceWorkerThread: Exiting");
-        });
-
-    // Запускаем потоки обновления токенов
     StartRefreshThreads();
 
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
@@ -1000,14 +922,12 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
     LogToFile(L"ServiceMain: RUNNING");
 
-    // Ждем сигнала остановки
     WaitForSingleObject(g_ServiceStopEvent, INFINITE);
     LogToFile(L"ServiceMain: Stop signal received");
 
     g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 
-    // Останавливаем потоки обновления
     g_bStopRefreshThreads = true;
     if (g_hRefreshThread) {
         WaitForSingleObject(g_hRefreshThread, 5000);
@@ -1020,11 +940,10 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
         g_hLicenseRefreshThread = NULL;
     }
 
-    // Останавливаем рабочий поток
-    if (workerThread) {
-        workerThread->join();
-        delete workerThread;
-        workerThread = NULL;
+    if (hWorkerThread) {
+        WaitForSingleObject(hWorkerThread, 5000);
+        CloseHandle(hWorkerThread);
+        hWorkerThread = NULL;
     }
 
     StopAllApps();
@@ -1077,6 +996,8 @@ VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode)
 DWORD WINAPI ServiceWorkerThreadStub(LPVOID lpParam) {
     LogToFile(L"ServiceWorkerThread: Started");
 
+    Sleep(3000);
+
     std::set<DWORD> known;
     WTS_SESSION_INFO* p = NULL;
     DWORD n = 0;
@@ -1085,7 +1006,7 @@ DWORD WINAPI ServiceWorkerThreadStub(LPVOID lpParam) {
         for (DWORD i = 0; i < n; i++) {
             if (p[i].SessionId == 0) continue;
             known.insert(p[i].SessionId);
-            if (p[i].State == WTSActive || p[i].State == WTSConnected || p[i].State == WTSDisconnected) {
+            if (p[i].State == WTSActive || p[i].State == WTSConnected) {
                 StartAppInSession(p[i].SessionId);
             }
         }
@@ -1119,6 +1040,10 @@ DWORD WINAPI ServiceWorkerThreadStub(LPVOID lpParam) {
 
 void StartAppInSession(DWORD sessionId)
 {
+    wchar_t buf[256];
+    wsprintf(buf, L"StartAppInSession: Attempting session %d", sessionId);
+    LogToFile(buf);
+
     {
         std::lock_guard<std::mutex> lock(g_ProcessMutex);
         auto it = g_SessionProcesses.find(sessionId);
@@ -1132,23 +1057,41 @@ void StartAppInSession(DWORD sessionId)
                     break;
                 }
             }
-            if (!allDead) return;
+            if (!allDead) {
+                wsprintf(buf, L"StartAppInSession: Session %d already has running process", sessionId);
+                LogToFile(buf);
+                return;
+            }
             it->second.clear();
         }
     }
 
     HANDLE hToken = NULL;
-    if (!WTSQueryUserToken(sessionId, &hToken)) return;
+    if (!WTSQueryUserToken(sessionId, &hToken)) {
+        wsprintf(buf, L"StartAppInSession: WTSQueryUserToken failed for session %d, error=%d", sessionId, GetLastError());
+        LogToFile(buf);
+        return;
+    }
 
     HANDLE hDup = NULL;
     if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup))
     {
+        wsprintf(buf, L"StartAppInSession: DuplicateTokenEx failed, error=%d", GetLastError());
+        LogToFile(buf);
         CloseHandle(hToken);
         return;
     }
     CloseHandle(hToken);
 
     std::wstring appPath = g_ServiceDirectory + L"\\TrayApp.exe";
+
+    if (!std::filesystem::exists(appPath)) {
+        wsprintf(buf, L"StartAppInSession: File not found: %s", appPath.c_str());
+        LogToFile(buf);
+        CloseHandle(hDup);
+        return;
+    }
+
     std::wstring cmdLine = L"\"" + appPath + L"\" --service";
 
     STARTUPINFO si = { sizeof(si) };
@@ -1162,10 +1105,18 @@ void StartAppInSession(DWORD sessionId)
     if (CreateProcessAsUser(hDup, NULL, (LPWSTR)cmdLine.c_str(), NULL, NULL, FALSE,
         CREATE_UNICODE_ENVIRONMENT, env, NULL, &si, &pi))
     {
-        ProtectProcessFromAll(pi.hProcess);
+        wsprintf(buf, L"StartAppInSession: Process created in session %d, PID=%d", sessionId, pi.dwProcessId);
+        LogToFile(buf);
+
+        ProtectProcessFromAdmins(pi.hProcess);
+
         std::lock_guard<std::mutex> lock(g_ProcessMutex);
         g_SessionProcesses[sessionId].push_back(pi.hProcess);
         CloseHandle(pi.hThread);
+    }
+    else {
+        wsprintf(buf, L"StartAppInSession: CreateProcessAsUser failed, error=%d", GetLastError());
+        LogToFile(buf);
     }
 
     if (env) DestroyEnvironmentBlock(env);
