@@ -2,9 +2,9 @@ name: Build TrayApp Windows Service
 
 on:
   push:
-    branches: [main, master, feature/windows-service-rpc]
+    branches: ['**']
   pull_request:
-    branches: [main, master]
+    branches: ['**']
 
 jobs:
   build:

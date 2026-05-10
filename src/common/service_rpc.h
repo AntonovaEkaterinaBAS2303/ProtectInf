@@ -3,13 +3,13 @@
 /* this ALWAYS GENERATED file contains the definitions for the interfaces */
 
 
- /* File created by MIDL compiler version 8.01.0622 */
+ /* File created by MIDL compiler version 8.01.0628 */
 /* at Tue Jan 19 06:14:07 2038
  */
 /* Compiler settings for rpc_interface.idl:
-    Oicf, W1, Zp8, env=Win64 (32b run), target_arch=IA64 8.01.0622 
+    Oicf, W1, Zp8, env=Win64 (32b run), target_arch=AMD64 8.01.0628 
     protocol : dce , ms_ext, c_ext, robust
-    error checks: allocation ref bounds_check enum stub_data , no_format_optimization
+    error checks: allocation ref bounds_check enum stub_data 
     VC __declspec() decoration level: 
          __declspec(uuid()), __declspec(selectany), __declspec(novtable)
          DECLSPEC_UUID(), MIDL_INTERFACE()
@@ -32,11 +32,19 @@
 #endif /* __RPCNDR_H_VERSION__ */
 
 
-#ifndef __rpc_h__
-#define __rpc_h__
+#ifndef __service_rpc_h__
+#define __service_rpc_h__
 
 #if defined(_MSC_VER) && (_MSC_VER >= 1020)
 #pragma once
+#endif
+
+#ifndef DECLSPEC_XFGVIRT
+#if defined(_CONTROL_FLOW_GUARD_XFG)
+#define DECLSPEC_XFGVIRT(base, func) __declspec(xfg_virtual(base, func))
+#else
+#define DECLSPEC_XFGVIRT(base, func)
+#endif
 #endif
 
 /* Forward Declarations */ 
@@ -50,16 +58,37 @@ extern "C"{
 #define __ServiceControl_INTERFACE_DEFINED__
 
 /* interface ServiceControl */
-/* [version][uuid] */ 
+/* [unique][version][uuid] */ 
 
 void StopService( 
-    /* [in] */ handle_t IDL_handle);
+    /* [in] */ handle_t hBinding);
 
 long GetStatus( 
-    /* [in] */ handle_t IDL_handle);
+    /* [in] */ handle_t hBinding);
 
 void Shutdown( 
+    /* [in] */ handle_t hBinding);
+
+long GetUserInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [string][out] */ wchar_t **username);
+
+long Login( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *username,
+    /* [string][in] */ const wchar_t *password);
+
+long Logout( 
     /* [in] */ handle_t IDL_handle);
+
+long GetLicenseInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ long *daysRemaining,
+    /* [string][out] */ wchar_t **expiryDate);
+
+long ActivateProduct( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *activationKey);
 
 
 
