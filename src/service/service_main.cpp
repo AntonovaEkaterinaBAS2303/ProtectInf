@@ -354,17 +354,23 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     std::vector<uint8_t> buffer(bufferSize);
 
     while (g_bMonitorActive) {
+        std::lock_guard<std::mutex> lock(g_MonitorMutex);
+
         for (auto& dir : g_MonitoredDirs) {
             if (dir.hDir == INVALID_HANDLE_VALUE) continue;
 
             DWORD bytesReturned = 0;
+
+            // Сбрасываем событие перед вызовом
+            ResetEvent(dir.overlapped.hEvent);
             ZeroMemory(&dir.overlapped, sizeof(OVERLAPPED));
+            dir.overlapped.hEvent = dir.overlapped.hEvent; // сохраняем хендл
 
             BOOL success = ReadDirectoryChangesW(
                 dir.hDir,
                 buffer.data(),
                 bufferSize,
-                dir.recursive,  // Watch subtree
+                dir.recursive,
                 FILE_NOTIFY_CHANGE_FILE_NAME |
                 FILE_NOTIFY_CHANGE_DIR_NAME |
                 FILE_NOTIFY_CHANGE_SIZE |
@@ -374,41 +380,40 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
                 NULL
             );
 
-            if (!success) continue;
+            if (success) {
+                // Ждем с таймаутом 500 мс
+                DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 500);
 
-            // Ждем завершения или таймаут 1 секунда
-            DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 1000);
+                if (waitResult == WAIT_OBJECT_0) {
+                    if (GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesReturned, FALSE)) {
+                        if (bytesReturned > 0) {
+                            FILE_NOTIFY_INFORMATION* notify = (FILE_NOTIFY_INFORMATION*)buffer.data();
 
-            if (waitResult == WAIT_OBJECT_0) {
-                GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesReturned, FALSE);
+                            do {
+                                std::wstring fileName(notify->FileName,
+                                    notify->FileNameLength / sizeof(wchar_t));
+                                std::wstring fullPath = dir.path + L"\\" + fileName;
 
-                if (bytesReturned > 0) {
-                    FILE_NOTIFY_INFORMATION* notify = (FILE_NOTIFY_INFORMATION*)buffer.data();
+                                if (notify->Action == FILE_ACTION_ADDED ||
+                                    notify->Action == FILE_ACTION_MODIFIED ||
+                                    notify->Action == FILE_ACTION_RENAMED_NEW_NAME) {
 
-                    do {
-                        if (notify->Action == FILE_ACTION_ADDED ||
-                            notify->Action == FILE_ACTION_MODIFIED ||
-                            notify->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+                                    // Небольшая задержка, чтобы файл точно записался
+                                    Sleep(200);
+                                    ProcessFileNotification(fullPath);
+                                }
 
-                            std::wstring fileName(notify->FileName,
-                                notify->FileNameLength / sizeof(wchar_t));
-                            std::wstring fullPath = dir.path + L"\\" + fileName;
-
-                            // Проверяем немедленно
-                            ProcessFileNotification(fullPath);
+                                if (notify->NextEntryOffset == 0) break;
+                                notify = (FILE_NOTIFY_INFORMATION*)((BYTE*)notify + notify->NextEntryOffset);
+                            } while (true);
                         }
-
-                        if (notify->NextEntryOffset == 0) break;
-                        notify = (FILE_NOTIFY_INFORMATION*)((BYTE*)notify + notify->NextEntryOffset);
-                    } while (true);
+                    }
                 }
-
-                // Пересоздаем событие
-                ResetEvent(dir.overlapped.hEvent);
             }
         }
 
-        Sleep(100);
+        // Небольшая пауза перед следующей проверкой
+        Sleep(200);
     }
 
     LogToFile(L"DirectoryMonitor: Exiting");
