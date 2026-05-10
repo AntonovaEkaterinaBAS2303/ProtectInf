@@ -74,6 +74,7 @@ struct AuthTokens {
 
 struct LicenseInfo {
     std::wstring ticket;
+    std::wstring licenseId;
     std::chrono::system_clock::time_point expiryDate;
     bool active = false;
 };
@@ -394,6 +395,8 @@ bool RefreshTokens() {
 
 bool RequestLicenseStatus() {
     std::wstring accessToken;
+    std::wstring licenseId;
+
     {
         std::lock_guard<std::mutex> authLock(g_AuthMutex);
         if (!g_AuthTokens) {
@@ -401,6 +404,13 @@ bool RequestLicenseStatus() {
             return false;
         }
         accessToken = g_AuthTokens->accessToken;
+    }
+
+    {
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        if (g_LicenseInfo) {
+            licenseId = g_LicenseInfo->licenseId;
+        }
     }
 
     LogToFile(L"RequestLicenseStatus: Checking license...");
@@ -411,7 +421,17 @@ bool RequestLicenseStatus() {
         return false;
     }
 
-    std::wstring body = L"{\"deviceMac\":\"" + GetDeviceMac() + L"\",\"productId\":\"" + PRODUCT_ID + L"\"}";
+    // ФОРМИРУЕМ ТЕЛО ЗАПРОСА С УЧЕТОМ ID ЛИЦЕНЗИИ
+    std::wstring body;
+    if (!licenseId.empty()) {
+        body = L"{\"deviceMac\":\"" + GetDeviceMac() +
+            L"\",\"productId\":\"" + PRODUCT_ID +
+            L"\",\"licenseId\":\"" + licenseId + L"\"}";
+    }
+    else {
+        body = L"{\"deviceMac\":\"" + GetDeviceMac() +
+            L"\",\"productId\":\"" + PRODUCT_ID + L"\"}";
+    }
 
     if (!client.SendRequest(L"POST", LICENSE_CHECK_ENDPOINT, body, accessToken)) {
         LogToFile(L"RequestLicenseStatus: Request failed");
@@ -430,17 +450,50 @@ bool RequestLicenseStatus() {
 
     std::wstring r = client.GetResponse();
 
+    // ПРОВЕРЯЕМ, НЕ ВЕРНУЛ ЛИ СЕРВЕР СПИСОК ЛИЦЕНЗИЙ
+    if (r.find(L"\"licenses\"") != std::wstring::npos) {
+        // Сервер вернул список лицензий — нужно выбрать одну
+        // Пока берем первую (позже можно добавить UI для выбора)
+        LogToFile(L"RequestLicenseStatus: Multiple licenses found, selecting first");
+
+        std::wstring firstLicenseId = ExtractJsonValue(r, L"licenseId");
+        std::wstring expDate = ExtractJsonValue(r, L"expirationDate");
+        std::wstring blocked = ExtractJsonValue(r, L"blocked");
+
+        bool isBlocked = (blocked == L"true");
+
+        if (!expDate.empty() && !isBlocked) {
+            auto expiryDate = ParseExpirationDate(expDate);
+            auto now = std::chrono::system_clock::now();
+            bool isExpired = (expiryDate < now);
+
+            if (!isExpired) {
+                std::lock_guard<std::mutex> ll(g_LicenseMutex);
+                if (!g_LicenseInfo) g_LicenseInfo = std::make_unique<LicenseInfo>();
+                g_LicenseInfo->licenseId = firstLicenseId;
+                g_LicenseInfo->active = true;
+                g_LicenseInfo->expiryDate = expiryDate;
+
+                LogToFile((L"RequestLicenseStatus: Selected license " + firstLicenseId).c_str());
+                return true;
+            }
+        }
+    }
+
+    // ОДИНОЧНАЯ ЛИЦЕНЗИЯ (старая логика)
     if (r.find(L"\"ticketSignature\"") != std::wstring::npos ||
         r.find(L"\"licenseCode\"") != std::wstring::npos) {
 
+        std::wstring lid = ExtractJsonValue(r, L"licenseId");
         std::wstring expDate = ExtractJsonValue(r, L"expirationDate");
         std::wstring blocked = ExtractJsonValue(r, L"blocked");
 
         bool isBlocked = (blocked == L"true");
         bool isExpired = false;
+        std::chrono::system_clock::time_point expiryDate;
 
         if (!expDate.empty()) {
-            auto expiryDate = ParseExpirationDate(expDate);
+            expiryDate = ParseExpirationDate(expDate);  // ОДИН ВЫЗОВ
             auto now = std::chrono::system_clock::now();
             isExpired = (expiryDate < now);
         }
@@ -450,13 +503,12 @@ bool RequestLicenseStatus() {
         std::lock_guard<std::mutex> ll(g_LicenseMutex);
         if (!g_LicenseInfo) g_LicenseInfo = std::make_unique<LicenseInfo>();
         g_LicenseInfo->active = isActive;
+        g_LicenseInfo->licenseId = lid;
+        g_LicenseInfo->expiryDate = expiryDate;  // Используем уже вычисленное значение
 
-        if (!expDate.empty()) {
-            g_LicenseInfo->expiryDate = ParseExpirationDate(expDate);
-        }
-
-        wsprintf(buf, L"RequestLicenseStatus: active=%d, blocked=%s, expired=%s",
-            isActive ? 1 : 0, blocked.c_str(), expDate.c_str());
+        wchar_t buf[64];
+        wsprintf(buf, L"RequestLicenseStatus: active=%d, licenseId=%s",
+            isActive ? 1 : 0, lid.c_str());
         LogToFile(buf);
 
         return isActive;
@@ -737,32 +789,10 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
 
     if (!daysRemaining || !expiryDate) return 1;
 
+    // Проверяем наличие токена
     {
         std::lock_guard<std::mutex> lock(g_AuthMutex);
-        if (g_AuthTokens && !g_AuthenticatedUser.empty()) {
-        }
-        else {
-            std::lock_guard<std::mutex> ll(g_LicenseMutex);
-            if (g_LicenseInfo && g_LicenseInfo->active) {
-                auto now = std::chrono::system_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::hours>(
-                    g_LicenseInfo->expiryDate - now);
-                long days = (long)(duration.count() / 24);
-
-                if (days > 0) {
-                    *daysRemaining = days;
-                    time_t expiry = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
-                    struct tm stm;
-                    localtime_s(&stm, &expiry);
-                    std::wstringstream wss;
-                    wss << std::put_time(&stm, L"%Y-%m-%d");
-                    std::wstring dateStr = wss.str();
-                    *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * (dateStr.length() + 1));
-                    if (*expiryDate) wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
-                    return 0;
-                }
-            }
-
+        if (!g_AuthTokens || g_AuthenticatedUser.empty()) {
             *daysRemaining = 0;
             *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
             if (*expiryDate) wcscpy_s(*expiryDate, 16, L"No License");
@@ -770,9 +800,11 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
         }
     }
 
+    // Запрашиваем статус лицензии с сервера
     LogToFile(L"GetLicenseInfo: Checking server for current status...");
     RequestLicenseStatus();
 
+    // Читаем результат ПОД ЗАЩИТОЙ МЬЮТЕКСА и сразу копируем данные
     std::lock_guard<std::mutex> lock(g_LicenseMutex);
     if (g_LicenseInfo && g_LicenseInfo->active) {
         auto now = std::chrono::system_clock::now();
@@ -781,7 +813,6 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
         long days = (long)(duration.count() / 24);
 
         if (days <= 0) {
-            g_LicenseInfo->active = false;
             *daysRemaining = 0;
             *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * 16);
             if (*expiryDate) wcscpy_s(*expiryDate, 16, L"Expired");
@@ -789,6 +820,8 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
         }
 
         *daysRemaining = days;
+
+        // Копируем дату в локальную переменную, пока мьютекс еще заблокирован
         time_t expiry = std::chrono::system_clock::to_time_t(g_LicenseInfo->expiryDate);
         struct tm stm;
         localtime_s(&stm, &expiry);
@@ -798,7 +831,10 @@ long GetLicenseInfo(handle_t h, long* daysRemaining, wchar_t** expiryDate) {
         std::wstring dateStr = wss.str();
 
         *expiryDate = (wchar_t*)MIDL_user_allocate(sizeof(wchar_t) * (dateStr.length() + 1));
-        if (*expiryDate) wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
+        if (*expiryDate) {
+            wcscpy_s(*expiryDate, dateStr.length() + 1, dateStr.c_str());
+        }
+
         return 0;
     }
 
