@@ -329,18 +329,19 @@ void ProcessFileNotification(const std::wstring& filePath) {
     if (!std::filesystem::exists(filePath)) return;
     if (!std::filesystem::is_regular_file(filePath)) return;
 
+    // Отладочное сообщение
+    wchar_t buf[512];
+    wsprintf(buf, L"[MONITOR] Scanning: %s", filePath.c_str());
+    LogToFile(buf);
+
     // Сканируем файл
     ScanResultData result;
     long scanRes = ScanFile(NULL, filePath.c_str(), &result);
 
     if (scanRes == 0 && result.isMalicious) {
-        wchar_t buf[512];
         wsprintf(buf, L"[MALWARE DETECTED] %s - Signatures: %d",
             filePath.c_str(), result.recordCount);
         LogToFile(buf);
-
-        // Здесь можно отправить уведомление клиенту через RPC
-        // или добавить в карантин
     }
 
     if (result.filePath) MIDL_user_free(result.filePath);
