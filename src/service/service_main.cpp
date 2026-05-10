@@ -324,28 +324,111 @@ void LoadDefaultAvDatabase() {
     g_AvDbReleaseDate = dateBuf;
 }
 
-void ProcessFileNotification(const std::wstring& filePath) {
-    // Проверяем существование файла
-    if (!std::filesystem::exists(filePath)) return;
-    if (!std::filesystem::is_regular_file(filePath)) return;
+bool IsScanTarget(const std::wstring& filePath) {
+    // Convert to lowercase for comparison
+    std::wstring lower = filePath;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
 
-    // Отладочное сообщение
+    // Check file extensions that could be malicious
+    static const std::vector<std::wstring> targetExtensions = {
+        L".exe", L".dll", L".sys", L".ocx", L".com", L".scr",
+        L".msi", L".bat", L".cmd", L".ps1", L".vbs", L".vbe",
+        L".js", L".jse", L".wsf", L".wsh", L".hta", L".jar",
+        L".py", L".pyc", L".php", L".asp", L".aspx",
+        L".doc", L".docm", L".xls", L".xlsm", L".ppt", L".pptm"
+    };
+
+    for (const auto& ext : targetExtensions) {
+        if (lower.length() >= ext.length() &&
+            lower.compare(lower.length() - ext.length(), ext.length(), ext) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void ProcessFileNotification(const std::wstring& filePath) {
+    // Log every file notification
     wchar_t buf[512];
-    wsprintf(buf, L"[MONITOR] Scanning: %s", filePath.c_str());
+    wsprintf(buf, L"[MONITOR] File event: %s", filePath.c_str());
     LogToFile(buf);
 
-    // Сканируем файл
-    ScanResultData result;
+    // Check file accessibility with retry
+    if (!std::filesystem::exists(filePath)) {
+        // Retry once after a delay
+        Sleep(100);
+        if (!std::filesystem::exists(filePath)) {
+            LogToFile(L"[MONITOR] File does not exist (after retry)");
+            return;
+        }
+    }
+
+    if (!std::filesystem::is_regular_file(filePath)) {
+        LogToFile(L"[MONITOR] Not a regular file");
+        return;
+    }
+
+    // Check file size
+    auto fileSize = std::filesystem::file_size(filePath);
+    wsprintf(buf, L"[MONITOR] File size: %llu bytes", fileSize);
+    LogToFile(buf);
+
+    // Skip files that are too large (e.g., > 100MB)
+    const uint64_t MAX_FILE_SIZE = 100 * 1024 * 1024;
+    if (fileSize > MAX_FILE_SIZE) {
+        LogToFile(L"[MONITOR] File too large, skipping scan");
+        return;
+    }
+
+    // Skip files that are too small to contain signatures
+    const uint64_t MIN_FILE_SIZE = 8;  // Minimum for prefix scanning
+    if (fileSize < MIN_FILE_SIZE) {
+        LogToFile(L"[MONITOR] File too small, skipping scan");
+        return;
+    }
+
+    // Check if license is active before scanning
+    bool isLicensed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_LicenseMutex);
+        isLicensed = (g_LicenseInfo && g_LicenseInfo->active);
+    }
+
+    if (!isLicensed) {
+        LogToFile(L"[MONITOR] License not active, skipping scan");
+        return;
+    }
+
+    if (!IsScanTarget(filePath)) {
+        LogToFile(L"[MONITOR] Not a scan target, skipping");
+        return;
+    }
+
+    // Scan the file
+    ScanResultData result = { 0 };
     long scanRes = ScanFile(NULL, filePath.c_str(), &result);
 
-    if (scanRes == 0 && result.isMalicious) {
-        wsprintf(buf, L"[MALWARE DETECTED] %s - Signatures: %d",
-            filePath.c_str(), result.recordCount);
+    if (scanRes == 0) {
+        if (result.isMalicious) {
+            wsprintf(buf, L"[MALWARE DETECTED] %s - Signatures: %d",
+                filePath.c_str(), result.recordCount);
+            LogToFile(buf);
+        }
+        else {
+            LogToFile(L"[MONITOR] File scanned - clean");
+        }
+    }
+    else {
+        wsprintf(buf, L"[MONITOR] Scan failed with error code: %d", scanRes);
         LogToFile(buf);
     }
 
+    // Clean up
     if (result.filePath) MIDL_user_free(result.filePath);
 }
+
+void ProcessDirectoryChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize);
 
 DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     LogToFile(L"DirectoryMonitor: Started");
@@ -354,78 +437,106 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     std::vector<uint8_t> buffer(bufferSize);
 
     while (g_bMonitorActive) {
-        std::lock_guard<std::mutex> lock(g_MonitorMutex);
+        {
+            std::lock_guard<std::mutex> lock(g_MonitorMutex);
 
-        for (auto& dir : g_MonitoredDirs) {
-            if (dir.hDir == INVALID_HANDLE_VALUE) continue;
+            for (auto& dir : g_MonitoredDirs) {
+                if (dir.hDir == INVALID_HANDLE_VALUE) continue;
 
-            DWORD bytesReturned = 0;
+                DWORD bytesReturned = 0;
 
-            // Сбрасываем событие перед вызовом
-            ResetEvent(dir.overlapped.hEvent);
-            ZeroMemory(&dir.overlapped, sizeof(OVERLAPPED));
-            dir.overlapped.hEvent = dir.overlapped.hEvent; // сохраняем хендл
+                // Properly initialize OVERLAPPED structure
+                ZeroMemory(&dir.overlapped, sizeof(OVERLAPPED));
+                dir.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+                if (!dir.overlapped.hEvent) continue;
 
-            BOOL success = ReadDirectoryChangesW(
-                dir.hDir,
-                buffer.data(),
-                bufferSize,
-                dir.recursive,
-                FILE_NOTIFY_CHANGE_FILE_NAME |
-                FILE_NOTIFY_CHANGE_DIR_NAME |
-                FILE_NOTIFY_CHANGE_SIZE |
-                FILE_NOTIFY_CHANGE_LAST_WRITE,
-                &bytesReturned,
-                &dir.overlapped,
-                NULL
-            );
+                BOOL success = ReadDirectoryChangesW(
+                    dir.hDir,
+                    buffer.data(),
+                    bufferSize,
+                    dir.recursive,
+                    FILE_NOTIFY_CHANGE_FILE_NAME |
+                    FILE_NOTIFY_CHANGE_DIR_NAME |
+                    FILE_NOTIFY_CHANGE_SIZE |
+                    FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    &bytesReturned,
+                    &dir.overlapped,
+                    NULL
+                );
 
-            if (success) {
-                // Ждем с таймаутом 500 мс
-                DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 500);
+                if (!success) {
+                    CloseHandle(dir.overlapped.hEvent);
+                    dir.overlapped.hEvent = NULL;
+                    continue;
+                }
+
+                // Wait for changes
+                DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 1000);
 
                 if (waitResult == WAIT_OBJECT_0) {
-                    if (GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesReturned, FALSE)) {
-                        if (bytesReturned > 0) {
-                            FILE_NOTIFY_INFORMATION* notify = (FILE_NOTIFY_INFORMATION*)buffer.data();
-
-                            do {
-                                std::wstring fileName(notify->FileName,
-                                    notify->FileNameLength / sizeof(wchar_t));
-                                std::wstring fullPath = dir.path + L"\\" + fileName;
-
-                                if (notify->Action == FILE_ACTION_ADDED ||
-                                    notify->Action == FILE_ACTION_MODIFIED ||
-                                    notify->Action == FILE_ACTION_RENAMED_NEW_NAME) {
-
-                                    // Небольшая задержка, чтобы файл точно записался
-                                    Sleep(200);
-                                    ProcessFileNotification(fullPath);
-                                }
-
-                                if (notify->NextEntryOffset == 0) break;
-                                notify = (FILE_NOTIFY_INFORMATION*)((BYTE*)notify + notify->NextEntryOffset);
-                            } while (true);
-                        }
+                    DWORD bytesTransferred = 0;
+                    if (GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesTransferred, FALSE)) {
+                        ProcessDirectoryChanges(dir, buffer.data(), bytesTransferred);
                     }
                 }
+
+                CloseHandle(dir.overlapped.hEvent);
+                dir.overlapped.hEvent = NULL;
             }
         }
 
-        // Небольшая пауза перед следующей проверкой
-        Sleep(200);
+        Sleep(100); // Small delay to prevent CPU spinning
     }
 
     LogToFile(L"DirectoryMonitor: Exiting");
     return 0;
 }
 
+// Helper function to process directory changes
+void ProcessDirectoryChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize) {
+    if (bufferSize == 0) return;
+
+    FILE_NOTIFY_INFORMATION* notify = (FILE_NOTIFY_INFORMATION*)buffer;
+
+    do {
+        std::wstring fileName(notify->FileName, notify->FileNameLength / sizeof(wchar_t));
+        std::wstring fullPath = dir.path + L"\\" + fileName;
+
+        // Filter for relevant actions
+        if (notify->Action == FILE_ACTION_ADDED ||
+            notify->Action == FILE_ACTION_MODIFIED ||
+            notify->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+
+            // Skip common temporary and system directories
+            std::wstring lowerPath = fullPath;
+            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+
+            if (lowerPath.find(L"\\appdata\\local\\temp") != std::wstring::npos ||
+                lowerPath.find(L"\\appdata\\local\\microsoft\\vsapplicationinsights") != std::wstring::npos ||
+                lowerPath.find(L"\\.minio.sys\\tmp") != std::wstring::npos ||
+                lowerPath.find(L"\\.minio.sys\\buckets") != std::wstring::npos ||
+                lowerPath.find(L"\\cookies") != std::wstring::npos ||
+                lowerPath.find(L"\\cookies-journal") != std::wstring::npos) {
+                continue;  // Skip these paths
+            }
+
+            // Add small delay to ensure file is fully written
+            Sleep(500);
+            ProcessFileNotification(fullPath);
+        }
+
+        // Check for next entry
+        if (notify->NextEntryOffset == 0) break;
+        notify = (FILE_NOTIFY_INFORMATION*)((BYTE*)notify + notify->NextEntryOffset);
+    } while (true);
+}
+
 long AddMonitoredDirectory(const std::wstring& path, bool recursive) {
     std::lock_guard<std::mutex> lock(g_MonitorMutex);
 
-    // Проверяем, не мониторим ли уже
+    // Check if already monitored
     for (const auto& dir : g_MonitoredDirs) {
-        if (dir.path == path) return 0;  // Уже мониторим
+        if (dir.path == path) return 0;
     }
 
     HANDLE hDir = CreateFileW(
@@ -450,7 +561,8 @@ long AddMonitoredDirectory(const std::wstring& path, bool recursive) {
     md.path = path;
     md.hDir = hDir;
     md.recursive = recursive;
-    md.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    md.overlapped = { 0 };  // Initialize with zeros
+    // Event will be created in the monitoring thread
 
     g_MonitoredDirs.push_back(md);
 
@@ -483,11 +595,20 @@ long RemoveMonitoredDirectory(const std::wstring& path) {
 }
 
 void StartMonitoring() {
-    if (g_bMonitorActive) return;
+    if (g_bMonitorActive) {
+        LogToFile(L"StartMonitoring: Already active, skipping");
+        return;
+    }
 
     g_bMonitorActive = true;
     g_hMonitorThread = CreateThread(NULL, 0, DirectoryMonitorThread, NULL, 0, NULL);
-    LogToFile(L"File monitoring started");
+    if (g_hMonitorThread) {
+        LogToFile(L"File monitoring started");
+    }
+    else {
+        LogToFile(L"Failed to create monitoring thread");
+        g_bMonitorActive = false;
+    }
 }
 
 void StopMonitoring() {
@@ -826,6 +947,9 @@ bool RequestLicenseStatus() {
     HttpClient client(API_HOST, API_PORT, API_USE_HTTPS);
     if (!client.Connect()) {
         LogToFile(L"RequestLicenseStatus: Connection failed");
+        // СБРАСЫВАЕМ ЛИЦЕНЗИЮ ПРИ ОШИБКЕ
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        if (g_LicenseInfo) g_LicenseInfo->active = false;
         return false;
     }
 
@@ -862,6 +986,7 @@ bool RequestLicenseStatus() {
     }
 
     std::wstring r = client.GetResponse();
+    bool licenseActivated = false;
 
     // ПРОВЕРЯЕМ, НЕ ВЕРНУЛ ЛИ СЕРВЕР СПИСОК ЛИЦЕНЗИЙ
     if (r.find(L"\"licenses\"") != std::wstring::npos) {
@@ -888,7 +1013,7 @@ bool RequestLicenseStatus() {
                 g_LicenseInfo->expiryDate = expiryDate;
 
                 LogToFile((L"RequestLicenseStatus: Selected license " + firstLicenseId).c_str());
-                return true;
+                licenseActivated = true;
             }
         }
     }
@@ -924,7 +1049,24 @@ bool RequestLicenseStatus() {
             isActive ? 1 : 0, lid.c_str());
         LogToFile(buf);
 
-        return isActive;
+        licenseActivated = isActive;
+    }
+
+    // Если лицензия активирована, запускаем мониторинг
+    if (licenseActivated) {
+        bool hasDirs = false;
+        {
+            std::lock_guard<std::mutex> lock(g_MonitorMutex);
+            hasDirs = !g_MonitoredDirs.empty();
+        }
+
+        if (hasDirs && !g_bMonitorActive) {
+            LogToFile(L"RequestLicenseStatus: License active, starting file monitoring...");
+            g_bMonitorActive = true;
+            g_hMonitorThread = CreateThread(NULL, 0, DirectoryMonitorThread, NULL, 0, NULL);
+            LogToFile(L"File monitoring started after license check");
+        }
+        return true;
     }
 
     LogToFile(L"RequestLicenseStatus: No license data found");
@@ -1017,6 +1159,20 @@ bool ActivateLicense(const std::wstring& code) {
             else {
                 LogToFile(L"AV Database not found, loading defaults...");
                 LoadDefaultAvDatabase();
+            }
+
+            // Запускаем мониторинг после успешной активации
+            bool hasDirs = false;
+            {
+                std::lock_guard<std::mutex> lock(g_MonitorMutex);
+                hasDirs = !g_MonitoredDirs.empty();
+            }
+
+            if (hasDirs && !g_bMonitorActive) {
+                LogToFile(L"ActivateLicense: Starting file monitoring after activation...");
+                g_bMonitorActive = true;
+                g_hMonitorThread = CreateThread(NULL, 0, DirectoryMonitorThread, NULL, 0, NULL);
+                LogToFile(L"File monitoring started after license activation");
             }
         }
 
@@ -1324,23 +1480,34 @@ long ScanDirectory(handle_t h, const wchar_t* dirPath, ScanResultData* results, 
     }
 
     *resultCount = 0;
+    const long MAX_RESULTS = 100;
 
-    // Сканируем все файлы в директории (упрощенно)
     try {
         for (const auto& entry : std::filesystem::recursive_directory_iterator(dirPath)) {
+            if (*resultCount >= MAX_RESULTS) break;
+
             if (entry.is_regular_file()) {
-                // Вызываем ScanFile для каждого файла
-                ScanResultData fileResult;
-                if (ScanFile(h, entry.path().c_str(), &fileResult) == 0 && fileResult.isMalicious) {
-                    if (*resultCount < 100) { // Ограничим массив
-                        results[*resultCount] = fileResult;
-                        (*resultCount)++;
+                ScanResultData fileResult = { 0 };
+                long scanRes = ScanFile(h, entry.path().c_str(), &fileResult);
+
+                if (scanRes == 0 && fileResult.isMalicious) {
+                    // Copy result to array
+                    results[*resultCount] = fileResult;
+                    (*resultCount)++;
+                }
+                else {
+                    // Clean up if not malicious
+                    if (fileResult.filePath) {
+                        MIDL_user_free(fileResult.filePath);
                     }
                 }
             }
         }
     }
-    catch (...) {
+    catch (const std::exception& e) {
+        // Log error
+        std::wstring wError(e.what(), e.what() + strlen(e.what()));
+        LogToFile((L"ScanDirectory exception: " + wError).c_str());
         return 1;
     }
 
@@ -1536,8 +1703,8 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
         }
     }
 
-    // Запускаем мониторинг директорий
-    AddMonitoredDirectory(L"C:\\Users", true);  // Мониторим домашнюю папку
+    // Добавляем директорию для мониторинга и запускаем мониторинг
+    AddMonitoredDirectory(L"C:\\Users", true);
     StartMonitoring();
 
     WaitForSingleObject(g_ServiceStopEvent, INFINITE);
