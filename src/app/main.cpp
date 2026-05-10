@@ -508,8 +508,13 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
                 if (EnsureServiceRunning()) break;
             }
         }
+        // Запущены не от службы - просто выходим (это нормально)
+        CloseHandle(hMutex);
         return 0;
     }
+
+    // Мы запущены от службы, ждем инициализации RPC
+    Sleep(2000);  // Даем службе время на инициализацию RPC сервера
 
     bool parentCheckPassed = false;
     DWORD parentPid = GetParentProcessId();
@@ -526,9 +531,8 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
     }
 
     if (!parentCheckPassed) {
-        if (!EnsureServiceRunning()) {
-            return 0;
-        }
+        CloseHandle(hMutex);
+        return 0;
     }
 
     WNDCLASSEX wc = { sizeof(wc) };
@@ -536,16 +540,34 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); wc.lpszMenuName = MAKEINTRESOURCE(IDC_TRAYAPP);
     wc.lpszClassName = _T("TrayAppClass"); wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
-    if (!RegisterClassEx(&wc)) return 1;
+    if (!RegisterClassEx(&wc)) {
+        CloseHandle(hMutex);
+        return 1;
+    }
 
     g_hWnd = CreateWindow(_T("TrayAppClass"), _T("TrayApp - Antivirus"), WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, 0, 450, 350, NULL, NULL, hi, NULL);
-    if (!g_hWnd) return 1;
+    if (!g_hWnd) {
+        CloseHandle(hMutex);
+        return 1;
+    }
 
     CreateUIControls(g_hWnd);
 
-    // Initialize RPC and check initial state
-    if (InitRpcBinding()) {
+    // Инициализируем RPC с повторными попытками
+    bool rpcInitialized = false;
+    for (int retry = 0; retry < 10; retry++) {
+        if (InitRpcBinding()) {
+            rpcInitialized = true;
+            break;
+        }
+        Sleep(1000);
+    }
+
+    if (rpcInitialized) {
+        // Небольшая задержка перед первым RPC вызовом
+        Sleep(500);
+
         wchar_t* username = NULL;
         long result = RpcGetUserInfoSafe(g_hRpcBinding, &username);
 
@@ -553,7 +575,7 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
             g_bAuthenticated = true;
             wcscpy_s(g_Username, username);
 
-            // Check license
+            // Проверяем лицензию
             long daysRemaining = 0;
             wchar_t* expiryDateStr = NULL;
             long licResult = RpcGetLicenseInfoSafe(g_hRpcBinding, &daysRemaining, &expiryDateStr);
@@ -570,21 +592,26 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
 
     UpdateUIState();
 
-    ShowWindow(g_hWnd, SW_HIDE);
+    // Показываем окно сразу при запуске от службы
+    ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
+    g_bMainWindowVisible = true;
 
     g_uTaskbarRestart = RegisterWindowMessage(_T("TaskbarCreated"));
     AddTrayIcon(g_hWnd);
-    g_bMainWindowVisible = false;
 
-    // Timer for periodic license check
+    // Таймер для периодической проверки лицензии
     SetTimer(g_hWnd, 1, 30000, NULL);
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
 
     KillTimer(g_hWnd, 1);
     CleanupRpcBinding();
+    CloseHandle(hMutex);
     return 0;
 }
 

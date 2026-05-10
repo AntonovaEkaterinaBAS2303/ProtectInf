@@ -149,6 +149,14 @@ std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& ex
 DWORD WINAPI TokenRefreshThread(LPVOID);
 DWORD WINAPI LicenseRefreshThread(LPVOID);
 void StartRefreshThreads();
+long AddMonitoredDirectory(const std::wstring& path, bool recursive);
+long RemoveMonitoredDirectory(const std::wstring& path);
+void StartMonitoring();
+void StopMonitoring();
+
+DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam);
+void ProcessFileNotification(const std::wstring& filePath);
+bool IsScanTarget(const std::wstring& filePath);
 
 ObjectType DetectFileType(const std::vector<uint8_t>& data) {
     if (data.size() < 4) return ObjectType::PE_FILE;
@@ -349,46 +357,38 @@ bool IsScanTarget(const std::wstring& filePath) {
 }
 
 void ProcessFileNotification(const std::wstring& filePath) {
-    // Log every file notification
+    // Быстрая проверка без длительных операций
+    if (!g_bMonitorActive) return;
+
     wchar_t buf[512];
     wsprintf(buf, L"[MONITOR] File event: %s", filePath.c_str());
     LogToFile(buf);
 
-    // Check file accessibility with retry
+    // Проверяем существование файла
     if (!std::filesystem::exists(filePath)) {
-        // Retry once after a delay
-        Sleep(100);
-        if (!std::filesystem::exists(filePath)) {
-            LogToFile(L"[MONITOR] File does not exist (after retry)");
-            return;
-        }
+        return;  // Быстрый возврат без повторных попыток
     }
 
     if (!std::filesystem::is_regular_file(filePath)) {
-        LogToFile(L"[MONITOR] Not a regular file");
         return;
     }
 
-    // Check file size
-    auto fileSize = std::filesystem::file_size(filePath);
-    wsprintf(buf, L"[MONITOR] File size: %llu bytes", fileSize);
-    LogToFile(buf);
+    // Проверяем размер файла
+    std::error_code ec;
+    auto fileSize = std::filesystem::file_size(filePath, ec);
+    if (ec) {
+        return;  // Ошибка получения размера
+    }
 
-    // Skip files that are too large (e.g., > 100MB)
+    // Фильтры размера
     const uint64_t MAX_FILE_SIZE = 100 * 1024 * 1024;
-    if (fileSize > MAX_FILE_SIZE) {
-        LogToFile(L"[MONITOR] File too large, skipping scan");
+    const uint64_t MIN_FILE_SIZE = 8;
+
+    if (fileSize > MAX_FILE_SIZE || fileSize < MIN_FILE_SIZE) {
         return;
     }
 
-    // Skip files that are too small to contain signatures
-    const uint64_t MIN_FILE_SIZE = 8;  // Minimum for prefix scanning
-    if (fileSize < MIN_FILE_SIZE) {
-        LogToFile(L"[MONITOR] File too small, skipping scan");
-        return;
-    }
-
-    // Check if license is active before scanning
+    // Быстрая проверка лицензии
     bool isLicensed = false;
     {
         std::lock_guard<std::mutex> lock(g_LicenseMutex);
@@ -396,16 +396,19 @@ void ProcessFileNotification(const std::wstring& filePath) {
     }
 
     if (!isLicensed) {
-        LogToFile(L"[MONITOR] License not active, skipping scan");
-        return;
+        return;  // Без логирования для ускорения
     }
 
+    // Проверка расширения файла
     if (!IsScanTarget(filePath)) {
-        LogToFile(L"[MONITOR] Not a scan target, skipping");
-        return;
+        return;  // Без логирования
     }
 
-    // Scan the file
+    // Только теперь логируем и сканируем
+    wsprintf(buf, L"[MONITOR] Scanning: %s (%llu bytes)", filePath.c_str(), fileSize);
+    LogToFile(buf);
+
+    // Сканируем файл
     ScanResultData result = { 0 };
     long scanRes = ScanFile(NULL, filePath.c_str(), &result);
 
@@ -415,20 +418,54 @@ void ProcessFileNotification(const std::wstring& filePath) {
                 filePath.c_str(), result.recordCount);
             LogToFile(buf);
         }
-        else {
-            LogToFile(L"[MONITOR] File scanned - clean");
-        }
-    }
-    else {
-        wsprintf(buf, L"[MONITOR] Scan failed with error code: %d", scanRes);
-        LogToFile(buf);
     }
 
-    // Clean up
     if (result.filePath) MIDL_user_free(result.filePath);
 }
 
-void ProcessDirectoryChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize);
+long AddMonitoredDirectory(const std::wstring& path, bool recursive) {
+    std::lock_guard<std::mutex> lock(g_MonitorMutex);
+
+    // Check if already monitored
+    for (const auto& dir : g_MonitoredDirs) {
+        if (dir.path == path) return 0;
+    }
+
+    HANDLE hDir = CreateFileW(
+        path.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        NULL
+    );
+
+    if (hDir == INVALID_HANDLE_VALUE) {
+        wchar_t buf[256];
+        wsprintf(buf, L"AddMonitoredDirectory: Failed to open %s, error=%d",
+            path.c_str(), GetLastError());
+        LogToFile(buf);
+        return 1;
+    }
+
+    MonitoredDirectory md;
+    md.path = path;
+    md.hDir = hDir;
+    md.recursive = recursive;
+    md.overlapped = { 0 };
+
+    g_MonitoredDirs.push_back(md);
+
+    wchar_t buf[256];
+    wsprintf(buf, L"Monitoring directory: %s (recursive=%d)", path.c_str(), recursive);
+    LogToFile(buf);
+
+    return 0;
+}
+
+void CollectFileChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize,
+    std::vector<std::wstring>& filesToProcess);
 
 DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     LogToFile(L"DirectoryMonitor: Started");
@@ -437,6 +474,9 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     std::vector<uint8_t> buffer(bufferSize);
 
     while (g_bMonitorActive) {
+        // Собираем изменения без длительной блокировки
+        std::vector<std::wstring> filesToProcess;
+
         {
             std::lock_guard<std::mutex> lock(g_MonitorMutex);
 
@@ -470,19 +510,26 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
                     continue;
                 }
 
-                // Wait for changes
-                DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 1000);
+                // Wait for changes with shorter timeout
+                DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 500);
 
                 if (waitResult == WAIT_OBJECT_0) {
                     DWORD bytesTransferred = 0;
                     if (GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesTransferred, FALSE)) {
-                        ProcessDirectoryChanges(dir, buffer.data(), bytesTransferred);
+                        // Собираем пути файлов, не обрабатывая их под мьютексом
+                        CollectFileChanges(dir, buffer.data(), bytesTransferred, filesToProcess);
                     }
                 }
 
                 CloseHandle(dir.overlapped.hEvent);
                 dir.overlapped.hEvent = NULL;
             }
+        } // Мьютекс освобождается здесь
+
+        // Обрабатываем файлы без блокировки мьютекса
+        for (const auto& filePath : filesToProcess) {
+            if (!g_bMonitorActive) break;
+            ProcessFileNotification(filePath);
         }
 
         Sleep(100); // Small delay to prevent CPU spinning
@@ -492,8 +539,9 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-// Helper function to process directory changes
-void ProcessDirectoryChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize) {
+// Новая функция для сбора изменений (без длительных операций)
+void CollectFileChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize,
+    std::vector<std::wstring>& filesToProcess) {
     if (bufferSize == 0) return;
 
     FILE_NOTIFY_INFORMATION* notify = (FILE_NOTIFY_INFORMATION*)buffer;
@@ -517,12 +565,11 @@ void ProcessDirectoryChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD buffer
                 lowerPath.find(L"\\.minio.sys\\buckets") != std::wstring::npos ||
                 lowerPath.find(L"\\cookies") != std::wstring::npos ||
                 lowerPath.find(L"\\cookies-journal") != std::wstring::npos) {
-                continue;  // Skip these paths
+                // Пропускаем эти пути
             }
-
-            // Add small delay to ensure file is fully written
-            Sleep(500);
-            ProcessFileNotification(fullPath);
+            else {
+                filesToProcess.push_back(fullPath);
+            }
         }
 
         // Check for next entry
@@ -531,47 +578,6 @@ void ProcessDirectoryChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD buffer
     } while (true);
 }
 
-long AddMonitoredDirectory(const std::wstring& path, bool recursive) {
-    std::lock_guard<std::mutex> lock(g_MonitorMutex);
-
-    // Check if already monitored
-    for (const auto& dir : g_MonitoredDirs) {
-        if (dir.path == path) return 0;
-    }
-
-    HANDLE hDir = CreateFileW(
-        path.c_str(),
-        FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-        NULL
-    );
-
-    if (hDir == INVALID_HANDLE_VALUE) {
-        wchar_t buf[256];
-        wsprintf(buf, L"AddMonitoredDirectory: Failed to open %s, error=%d",
-            path.c_str(), GetLastError());
-        LogToFile(buf);
-        return 1;
-    }
-
-    MonitoredDirectory md;
-    md.path = path;
-    md.hDir = hDir;
-    md.recursive = recursive;
-    md.overlapped = { 0 };  // Initialize with zeros
-    // Event will be created in the monitoring thread
-
-    g_MonitoredDirs.push_back(md);
-
-    wchar_t buf[256];
-    wsprintf(buf, L"Monitoring directory: %s (recursive=%d)", path.c_str(), recursive);
-    LogToFile(buf);
-
-    return 0;
-}
 
 long RemoveMonitoredDirectory(const std::wstring& path) {
     std::lock_guard<std::mutex> lock(g_MonitorMutex);
