@@ -573,6 +573,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 }
             }
             if (expiryDateStr) MIDL_user_free(expiryDateStr);
+            UpdateUIState();
         }
         break;
 

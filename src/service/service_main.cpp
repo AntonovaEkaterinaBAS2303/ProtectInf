@@ -421,7 +421,6 @@ bool RequestLicenseStatus() {
         return false;
     }
 
-    // ФОРМИРУЕМ ТЕЛО ЗАПРОСА С УЧЕТОМ ID ЛИЦЕНЗИИ
     std::wstring body;
     if (!licenseId.empty()) {
         body = L"{\"deviceMac\":\"" + GetDeviceMac() +
@@ -435,6 +434,9 @@ bool RequestLicenseStatus() {
 
     if (!client.SendRequest(L"POST", LICENSE_CHECK_ENDPOINT, body, accessToken)) {
         LogToFile(L"RequestLicenseStatus: Request failed");
+        // СБРАСЫВАЕМ ЛИЦЕНЗИЮ ПРИ ОШИБКЕ
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        if (g_LicenseInfo) g_LicenseInfo->active = false;
         return false;
     }
 
@@ -445,6 +447,9 @@ bool RequestLicenseStatus() {
 
     if (status != 200) {
         LogToFile(L"RequestLicenseStatus: Non-200 status");
+        // СБРАСЫВАЕМ ЛИЦЕНЗИЮ ПРИ ОШИБКЕ СЕРВЕРА
+        std::lock_guard<std::mutex> ll(g_LicenseMutex);
+        if (g_LicenseInfo) g_LicenseInfo->active = false;
         return false;
     }
 
