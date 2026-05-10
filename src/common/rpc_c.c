@@ -32,8 +32,8 @@
 
 #include "service_rpc.h"
 
-#define TYPE_FORMAT_STRING_SIZE   19                                
-#define PROC_FORMAT_STRING_SIZE   313                               
+#define TYPE_FORMAT_STRING_SIZE   61                                
+#define PROC_FORMAT_STRING_SIZE   589                               
 #define EXPR_FORMAT_STRING_SIZE   1                                 
 #define TRANSMIT_AS_TABLE_SIZE    0            
 #define WIRE_MARSHAL_TABLE_SIZE   0            
@@ -273,6 +273,116 @@ long ActivateProduct(
                   (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[270],
                   hBinding,
                   activationKey);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long ScanFile( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *filePath,
+    /* [out] */ ScanResultData *result)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[312],
+                  hBinding,
+                  filePath,
+                  result);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long ScanDirectory( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *dirPath,
+    /* [out] */ ScanResultData *results,
+    /* [out] */ long *resultCount)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[360],
+                  hBinding,
+                  dirPath,
+                  results,
+                  resultCount);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long GetAvDbInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ AvDbInfo *info)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[414],
+                  hBinding,
+                  info);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long AddMonitoredDir( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *dirPath,
+    /* [in] */ long recursive)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[456],
+                  hBinding,
+                  dirPath,
+                  recursive);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long RemoveMonitoredDir( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *dirPath)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[504],
+                  hBinding,
+                  dirPath);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long GetMonitoredDirs( 
+    /* [in] */ handle_t hBinding,
+    /* [string][out] */ wchar_t **dirList)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &rpc_interface__MIDL_ProcFormatString.Format[546],
+                  hBinding,
+                  dirList);
     return ( long  )_RetVal.Simple;
     
 }
@@ -534,6 +644,236 @@ static const rpc_interface_MIDL_PROC_FORMAT_STRING rpc_interface__MIDL_ProcForma
 /* 310 */	0x8,		/* FC_LONG */
 			0x0,		/* 0 */
 
+	/* Procedure ScanFile */
+
+/* 312 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 314 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 318 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 320 */	NdrFcShort( 0x20 ),	/* X64 Stack size/offset = 32 */
+/* 322 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 324 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 326 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 328 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 330 */	0x47,		/* Oi2 Flags:  srv must size, clt must size, has return, has ext, */
+			0x3,		/* 3 */
+/* 332 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 334 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 336 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 338 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 340 */	NdrFcShort( 0x0 ),	/* 0 */
+
+	/* Parameter filePath */
+
+/* 342 */	NdrFcShort( 0x10b ),	/* Flags:  must size, must free, in, simple ref, */
+/* 344 */	NdrFcShort( 0x8 ),	/* X64 Stack size/offset = 8 */
+/* 346 */	NdrFcShort( 0xc ),	/* Type Offset=12 */
+
+	/* Parameter result */
+
+/* 348 */	NdrFcShort( 0x6113 ),	/* Flags:  must size, must free, out, simple ref, srv alloc size=24 */
+/* 350 */	NdrFcShort( 0x10 ),	/* X64 Stack size/offset = 16 */
+/* 352 */	NdrFcShort( 0x16 ),	/* Type Offset=22 */
+
+	/* Return value */
+
+/* 354 */	NdrFcShort( 0x70 ),	/* Flags:  out, return, base type, */
+/* 356 */	NdrFcShort( 0x18 ),	/* X64 Stack size/offset = 24 */
+/* 358 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Procedure ScanDirectory */
+
+/* 360 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 362 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 366 */	NdrFcShort( 0x9 ),	/* 9 */
+/* 368 */	NdrFcShort( 0x28 ),	/* X64 Stack size/offset = 40 */
+/* 370 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 372 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 374 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 376 */	NdrFcShort( 0x24 ),	/* 36 */
+/* 378 */	0x47,		/* Oi2 Flags:  srv must size, clt must size, has return, has ext, */
+			0x4,		/* 4 */
+/* 380 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 382 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 384 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 386 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 388 */	NdrFcShort( 0x0 ),	/* 0 */
+
+	/* Parameter dirPath */
+
+/* 390 */	NdrFcShort( 0x10b ),	/* Flags:  must size, must free, in, simple ref, */
+/* 392 */	NdrFcShort( 0x8 ),	/* X64 Stack size/offset = 8 */
+/* 394 */	NdrFcShort( 0xc ),	/* Type Offset=12 */
+
+	/* Parameter results */
+
+/* 396 */	NdrFcShort( 0x6113 ),	/* Flags:  must size, must free, out, simple ref, srv alloc size=24 */
+/* 398 */	NdrFcShort( 0x10 ),	/* X64 Stack size/offset = 16 */
+/* 400 */	NdrFcShort( 0x16 ),	/* Type Offset=22 */
+
+	/* Parameter resultCount */
+
+/* 402 */	NdrFcShort( 0x2150 ),	/* Flags:  out, base type, simple ref, srv alloc size=8 */
+/* 404 */	NdrFcShort( 0x18 ),	/* X64 Stack size/offset = 24 */
+/* 406 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Return value */
+
+/* 408 */	NdrFcShort( 0x70 ),	/* Flags:  out, return, base type, */
+/* 410 */	NdrFcShort( 0x20 ),	/* X64 Stack size/offset = 32 */
+/* 412 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Procedure GetAvDbInfo */
+
+/* 414 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 416 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 420 */	NdrFcShort( 0xa ),	/* 10 */
+/* 422 */	NdrFcShort( 0x18 ),	/* X64 Stack size/offset = 24 */
+/* 424 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 426 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 428 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 430 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 432 */	0x45,		/* Oi2 Flags:  srv must size, has return, has ext, */
+			0x2,		/* 2 */
+/* 434 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 436 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 438 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 440 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 442 */	NdrFcShort( 0x0 ),	/* 0 */
+
+	/* Parameter info */
+
+/* 444 */	NdrFcShort( 0x4113 ),	/* Flags:  must size, must free, out, simple ref, srv alloc size=16 */
+/* 446 */	NdrFcShort( 0x8 ),	/* X64 Stack size/offset = 8 */
+/* 448 */	NdrFcShort( 0x2c ),	/* Type Offset=44 */
+
+	/* Return value */
+
+/* 450 */	NdrFcShort( 0x70 ),	/* Flags:  out, return, base type, */
+/* 452 */	NdrFcShort( 0x10 ),	/* X64 Stack size/offset = 16 */
+/* 454 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Procedure AddMonitoredDir */
+
+/* 456 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 458 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 462 */	NdrFcShort( 0xb ),	/* 11 */
+/* 464 */	NdrFcShort( 0x20 ),	/* X64 Stack size/offset = 32 */
+/* 466 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 468 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 470 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 472 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 474 */	0x46,		/* Oi2 Flags:  clt must size, has return, has ext, */
+			0x3,		/* 3 */
+/* 476 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 478 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 480 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 482 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 484 */	NdrFcShort( 0x0 ),	/* 0 */
+
+	/* Parameter dirPath */
+
+/* 486 */	NdrFcShort( 0x10b ),	/* Flags:  must size, must free, in, simple ref, */
+/* 488 */	NdrFcShort( 0x8 ),	/* X64 Stack size/offset = 8 */
+/* 490 */	NdrFcShort( 0xc ),	/* Type Offset=12 */
+
+	/* Parameter recursive */
+
+/* 492 */	NdrFcShort( 0x48 ),	/* Flags:  in, base type, */
+/* 494 */	NdrFcShort( 0x10 ),	/* X64 Stack size/offset = 16 */
+/* 496 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Return value */
+
+/* 498 */	NdrFcShort( 0x70 ),	/* Flags:  out, return, base type, */
+/* 500 */	NdrFcShort( 0x18 ),	/* X64 Stack size/offset = 24 */
+/* 502 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Procedure RemoveMonitoredDir */
+
+/* 504 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 506 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 510 */	NdrFcShort( 0xc ),	/* 12 */
+/* 512 */	NdrFcShort( 0x18 ),	/* X64 Stack size/offset = 24 */
+/* 514 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 516 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 518 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 520 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 522 */	0x46,		/* Oi2 Flags:  clt must size, has return, has ext, */
+			0x2,		/* 2 */
+/* 524 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 526 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 528 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 530 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 532 */	NdrFcShort( 0x0 ),	/* 0 */
+
+	/* Parameter dirPath */
+
+/* 534 */	NdrFcShort( 0x10b ),	/* Flags:  must size, must free, in, simple ref, */
+/* 536 */	NdrFcShort( 0x8 ),	/* X64 Stack size/offset = 8 */
+/* 538 */	NdrFcShort( 0xc ),	/* Type Offset=12 */
+
+	/* Return value */
+
+/* 540 */	NdrFcShort( 0x70 ),	/* Flags:  out, return, base type, */
+/* 542 */	NdrFcShort( 0x10 ),	/* X64 Stack size/offset = 16 */
+/* 544 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
+	/* Procedure GetMonitoredDirs */
+
+/* 546 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 548 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 552 */	NdrFcShort( 0xd ),	/* 13 */
+/* 554 */	NdrFcShort( 0x18 ),	/* X64 Stack size/offset = 24 */
+/* 556 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 558 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 560 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 562 */	NdrFcShort( 0x8 ),	/* 8 */
+/* 564 */	0x45,		/* Oi2 Flags:  srv must size, has return, has ext, */
+			0x2,		/* 2 */
+/* 566 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 568 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 570 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 572 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 574 */	NdrFcShort( 0x0 ),	/* 0 */
+
+	/* Parameter dirList */
+
+/* 576 */	NdrFcShort( 0x2013 ),	/* Flags:  must size, must free, out, srv alloc size=8 */
+/* 578 */	NdrFcShort( 0x8 ),	/* X64 Stack size/offset = 8 */
+/* 580 */	NdrFcShort( 0x2 ),	/* Type Offset=2 */
+
+	/* Return value */
+
+/* 582 */	NdrFcShort( 0x70 ),	/* Flags:  out, return, base type, */
+/* 584 */	NdrFcShort( 0x10 ),	/* X64 Stack size/offset = 16 */
+/* 586 */	0x8,		/* FC_LONG */
+			0x0,		/* 0 */
+
 			0x0
         }
     };
@@ -560,6 +900,44 @@ static const rpc_interface_MIDL_TYPE_FORMAT_STRING rpc_interface__MIDL_TypeForma
 			0x11, 0xc,	/* FC_RP [alloced_on_stack] [simple_pointer] */
 /* 16 */	0x8,		/* FC_LONG */
 			0x5c,		/* FC_PAD */
+/* 18 */	
+			0x11, 0x4,	/* FC_RP [alloced_on_stack] */
+/* 20 */	NdrFcShort( 0x2 ),	/* Offset= 2 (22) */
+/* 22 */	
+			0x1a,		/* FC_BOGUS_STRUCT */
+			0x3,		/* 3 */
+/* 24 */	NdrFcShort( 0x18 ),	/* 24 */
+/* 26 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 28 */	NdrFcShort( 0x8 ),	/* Offset= 8 (36) */
+/* 30 */	0x8,		/* FC_LONG */
+			0x40,		/* FC_STRUCTPAD4 */
+/* 32 */	0x36,		/* FC_POINTER */
+			0x8,		/* FC_LONG */
+/* 34 */	0x40,		/* FC_STRUCTPAD4 */
+			0x5b,		/* FC_END */
+/* 36 */	
+			0x12, 0x8,	/* FC_UP [simple_pointer] */
+/* 38 */	
+			0x25,		/* FC_C_WSTRING */
+			0x5c,		/* FC_PAD */
+/* 40 */	
+			0x11, 0x4,	/* FC_RP [alloced_on_stack] */
+/* 42 */	NdrFcShort( 0x2 ),	/* Offset= 2 (44) */
+/* 44 */	
+			0x1a,		/* FC_BOGUS_STRUCT */
+			0x3,		/* 3 */
+/* 46 */	NdrFcShort( 0x10 ),	/* 16 */
+/* 48 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 50 */	NdrFcShort( 0x6 ),	/* Offset= 6 (56) */
+/* 52 */	0x36,		/* FC_POINTER */
+			0x8,		/* FC_LONG */
+/* 54 */	0x40,		/* FC_STRUCTPAD4 */
+			0x5b,		/* FC_END */
+/* 56 */	
+			0x12, 0x8,	/* FC_UP [simple_pointer] */
+/* 58 */	
+			0x25,		/* FC_C_WSTRING */
+			0x5c,		/* FC_PAD */
 
 			0x0
         }
@@ -574,7 +952,13 @@ static const unsigned short ServiceControl_FormatStringOffsetTable[] =
     138,
     186,
     222,
-    270
+    270,
+    312,
+    360,
+    414,
+    456,
+    504,
+    546
     };
 
 

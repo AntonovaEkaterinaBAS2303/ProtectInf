@@ -27,6 +27,9 @@
 
 #include "../common/service_rpc.h"
 
+#include <wincrypt.h>
+#pragma comment(lib, "advapi32.lib")
+
 #define SERVICE_NAME L"TrayAppService"
 #define AUTH_ENDPOINT L"/auth/login"
 #define REFRESH_ENDPOINT L"/auth/refresh"
@@ -67,6 +70,50 @@ void LogToFile(const wchar_t* msg)
     }
 }
 
+// Типы сканируемых объектов
+enum class ObjectType : uint32_t {
+    PE_FILE = 1,        // PE исполняемые файлы
+    DOTNET_ASSEMBLY = 2,// .NET сборки
+    JAVA_CLASS = 3,     // Java классы
+    PYTHON_SCRIPT = 4,  // Python скрипты
+    JAVASCRIPT = 5,     // JavaScript
+    POWERSHELL = 6      // PowerShell скрипты
+};
+
+// Запись антивирусной базы
+struct AvRecord {
+    uint64_t objectSignaturePrefix;  // Первые 8 байт сигнатуры
+    uint32_t objectSignatureLength;  // Длина сигнатуры (включая префикс)
+    std::vector<uint8_t> objectSignature; // Хеш сигнатуры
+    uint64_t offsetBegin;            // Начало интервала поиска
+    uint64_t offsetEnd;              // Конец интервала поиска
+    ObjectType objectType;           // Тип объекта
+    std::vector<uint8_t> avRecordSignature; // ЭЦП записи
+};
+
+struct MonitoredDirectory {
+    std::wstring path;
+    HANDLE hDir;
+    bool recursive;
+    std::vector<uint8_t> buffer;
+    OVERLAPPED overlapped;
+};
+
+std::vector<MonitoredDirectory> g_MonitoredDirs;
+std::mutex g_MonitorMutex;
+HANDLE g_hMonitorThread = NULL;
+HANDLE g_hIOCP = NULL;  // IO Completion Port
+bool g_bMonitorActive = false;
+
+// Callback для уведомления клиентов об обнаружении
+typedef void (*MalwareFoundCallback)(const wchar_t* filePath, const wchar_t* signatureName);
+
+// Антивирусная база (красно-чёрное дерево)
+std::map<uint64_t, std::vector<AvRecord>> g_AvDatabase;
+std::mutex g_AvDbMutex;
+std::wstring g_AvDbReleaseDate;
+size_t g_AvDbRecordCount = 0;
+
 struct AuthTokens {
     std::wstring accessToken, refreshToken;
     std::chrono::system_clock::time_point accessExpiry, refreshExpiry;
@@ -102,6 +149,361 @@ std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& ex
 DWORD WINAPI TokenRefreshThread(LPVOID);
 DWORD WINAPI LicenseRefreshThread(LPVOID);
 void StartRefreshThreads();
+
+ObjectType DetectFileType(const std::vector<uint8_t>& data) {
+    if (data.size() < 4) return ObjectType::PE_FILE;
+
+    // PE файл: MZ сигнатура
+    if (data[0] == 'M' && data[1] == 'Z')
+        return ObjectType::PE_FILE;
+
+    // Java Class: CA FE BA BE
+    if (data.size() >= 4 &&
+        data[0] == 0xCA && data[1] == 0xFE &&
+        data[2] == 0xBA && data[3] == 0xBE)
+        return ObjectType::JAVA_CLASS;
+
+    // .NET Assembly: MZ + PE
+    if (data[0] == 'M' && data[1] == 'Z') {
+        // Проверить наличие CLR заголовка
+        return ObjectType::DOTNET_ASSEMBLY;
+    }
+
+    return ObjectType::PE_FILE;
+}
+
+std::vector<uint8_t> CalculateHash(const std::vector<uint8_t>& data) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    std::vector<uint8_t> hash(32); // SHA-256
+
+    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        return hash;
+
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return hash;
+    }
+
+    if (!CryptHashData(hHash, data.data(), (DWORD)data.size(), 0)) {
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hProv, 0);
+        return hash;
+    }
+
+    DWORD hashLen = 32;
+    CryptGetHashParam(hHash, HP_HASHVAL, hash.data(), &hashLen, 0);
+
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return hash;
+}
+
+struct ScanResult {
+    bool isMalicious;
+    std::vector<AvRecord> matchedRecords;
+    std::wstring filePath;
+};
+
+ScanResult ScanStream(const std::vector<uint8_t>& data, ObjectType fileType) {
+    ScanResult result = { false, {}, L"" };
+
+    if (data.size() < 8) return result;
+
+    size_t position = 0;
+
+    while (position <= data.size() - 8) {
+        // 3.2: Считать 8 байт и найти в дереве
+        uint64_t prefix = 0;
+        memcpy(&prefix, data.data() + position, 8);
+
+        std::lock_guard<std::mutex> lock(g_AvDbMutex);
+        auto it = g_AvDatabase.find(prefix);
+
+        if (it != g_AvDatabase.end()) {
+            std::vector<AvRecord> candidates = it->second;
+
+            // 3.3: Проверить каждую запись
+            for (const auto& record : candidates) {
+                // 3.3.1: Проверить тип объекта
+                if (record.objectType != fileType)
+                    continue;
+
+                // 3.3.2: Проверить диапазон
+                if (position < record.offsetBegin || position > record.offsetEnd)
+                    continue;
+
+                // 3.3.3: Считать дополнительные байты
+                if (position + record.objectSignatureLength > data.size())
+                    continue;
+
+                std::vector<uint8_t> signatureData(
+                    data.begin() + position,
+                    data.begin() + position + record.objectSignatureLength
+                );
+
+                // 3.3.4: Подсчитать хеш
+                auto hash = CalculateHash(signatureData);
+
+                // 3.3.5: Сравнить хеши
+                if (hash == record.objectSignature) {
+                    result.isMalicious = true;
+                    result.matchedRecords.push_back(record);
+                }
+            }
+
+            // 3.6: Найдено совпадение
+            if (result.isMalicious)
+                break;
+        }
+
+        // 3.5: Сдвинуть позицию на 1 байт
+        position++;
+    }
+
+    return result;
+}
+
+
+bool LoadAvDatabase(const std::wstring& dbPath) {
+    // Формат: JSON или бинарный файл с записями
+    std::ifstream file(dbPath, std::ios::binary);
+    if (!file) return false;
+
+    // Читаем заголовок
+    uint32_t recordCount;
+    file.read((char*)&recordCount, sizeof(recordCount));
+
+    std::lock_guard<std::mutex> lock(g_AvDbMutex);
+    g_AvDatabase.clear();
+
+    for (uint32_t i = 0; i < recordCount; i++) {
+        AvRecord record;
+        file.read((char*)&record.objectSignaturePrefix, 8);
+        file.read((char*)&record.objectSignatureLength, 4);
+
+        record.objectSignature.resize(record.objectSignatureLength);
+        file.read((char*)record.objectSignature.data(), record.objectSignatureLength);
+
+        file.read((char*)&record.offsetBegin, 8);
+        file.read((char*)&record.offsetEnd, 8);
+        file.read((char*)&record.objectType, sizeof(ObjectType));
+
+        uint32_t sigLen;
+        file.read((char*)&sigLen, 4);
+        record.avRecordSignature.resize(sigLen);
+        file.read((char*)record.avRecordSignature.data(), sigLen);
+
+        g_AvDatabase[record.objectSignaturePrefix].push_back(record);
+    }
+
+    g_AvDbRecordCount = recordCount;
+    return true;
+}
+
+void LoadDefaultAvDatabase() {
+    std::lock_guard<std::mutex> lock(g_AvDbMutex);
+    g_AvDatabase.clear();
+
+    // Добавляем тестовую сигнатуру для EICAR (стандартный тестовый вирус)
+    AvRecord eicar;
+    eicar.objectSignaturePrefix = 0x214354562D535458; // "X5O!P%@"
+    eicar.objectSignatureLength = 8;
+    eicar.objectSignature = CalculateHash(std::vector<uint8_t>{'X', '5', 'O', '!', 'P', '%', '@', 'A'});
+    eicar.offsetBegin = 0;
+    eicar.offsetEnd = 100;
+    eicar.objectType = ObjectType::PE_FILE;
+    g_AvDatabase[eicar.objectSignaturePrefix].push_back(eicar);
+
+    g_AvDbRecordCount = 1;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t dateBuf[64];
+    wsprintf(dateBuf, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+    g_AvDbReleaseDate = dateBuf;
+}
+
+void ProcessFileNotification(const std::wstring& filePath) {
+    // Проверяем существование файла
+    if (!std::filesystem::exists(filePath)) return;
+    if (!std::filesystem::is_regular_file(filePath)) return;
+
+    // Сканируем файл
+    ScanResultData result;
+    long scanRes = ScanFile(NULL, filePath.c_str(), &result);
+
+    if (scanRes == 0 && result.isMalicious) {
+        wchar_t buf[512];
+        wsprintf(buf, L"[MALWARE DETECTED] %s - Signatures: %d",
+            filePath.c_str(), result.recordCount);
+        LogToFile(buf);
+
+        // Здесь можно отправить уведомление клиенту через RPC
+        // или добавить в карантин
+    }
+
+    if (result.filePath) MIDL_user_free(result.filePath);
+}
+
+DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
+    LogToFile(L"DirectoryMonitor: Started");
+
+    const DWORD bufferSize = 65536;
+    std::vector<uint8_t> buffer(bufferSize);
+
+    while (g_bMonitorActive) {
+        for (auto& dir : g_MonitoredDirs) {
+            if (dir.hDir == INVALID_HANDLE_VALUE) continue;
+
+            DWORD bytesReturned = 0;
+            ZeroMemory(&dir.overlapped, sizeof(OVERLAPPED));
+
+            BOOL success = ReadDirectoryChangesW(
+                dir.hDir,
+                buffer.data(),
+                bufferSize,
+                dir.recursive,  // Watch subtree
+                FILE_NOTIFY_CHANGE_FILE_NAME |
+                FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_SIZE |
+                FILE_NOTIFY_CHANGE_LAST_WRITE,
+                &bytesReturned,
+                &dir.overlapped,
+                NULL
+            );
+
+            if (!success) continue;
+
+            // Ждем завершения или таймаут 1 секунда
+            DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 1000);
+
+            if (waitResult == WAIT_OBJECT_0) {
+                GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesReturned, FALSE);
+
+                if (bytesReturned > 0) {
+                    FILE_NOTIFY_INFORMATION* notify = (FILE_NOTIFY_INFORMATION*)buffer.data();
+
+                    do {
+                        if (notify->Action == FILE_ACTION_ADDED ||
+                            notify->Action == FILE_ACTION_MODIFIED ||
+                            notify->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+
+                            std::wstring fileName(notify->FileName,
+                                notify->FileNameLength / sizeof(wchar_t));
+                            std::wstring fullPath = dir.path + L"\\" + fileName;
+
+                            // Проверяем немедленно
+                            ProcessFileNotification(fullPath);
+                        }
+
+                        if (notify->NextEntryOffset == 0) break;
+                        notify = (FILE_NOTIFY_INFORMATION*)((BYTE*)notify + notify->NextEntryOffset);
+                    } while (true);
+                }
+
+                // Пересоздаем событие
+                ResetEvent(dir.overlapped.hEvent);
+            }
+        }
+
+        Sleep(100);
+    }
+
+    LogToFile(L"DirectoryMonitor: Exiting");
+    return 0;
+}
+
+long AddMonitoredDirectory(const std::wstring& path, bool recursive) {
+    std::lock_guard<std::mutex> lock(g_MonitorMutex);
+
+    // Проверяем, не мониторим ли уже
+    for (const auto& dir : g_MonitoredDirs) {
+        if (dir.path == path) return 0;  // Уже мониторим
+    }
+
+    HANDLE hDir = CreateFileW(
+        path.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        NULL
+    );
+
+    if (hDir == INVALID_HANDLE_VALUE) {
+        wchar_t buf[256];
+        wsprintf(buf, L"AddMonitoredDirectory: Failed to open %s, error=%d",
+            path.c_str(), GetLastError());
+        LogToFile(buf);
+        return 1;
+    }
+
+    MonitoredDirectory md;
+    md.path = path;
+    md.hDir = hDir;
+    md.recursive = recursive;
+    md.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    g_MonitoredDirs.push_back(md);
+
+    wchar_t buf[256];
+    wsprintf(buf, L"Monitoring directory: %s (recursive=%d)", path.c_str(), recursive);
+    LogToFile(buf);
+
+    return 0;
+}
+
+long RemoveMonitoredDirectory(const std::wstring& path) {
+    std::lock_guard<std::mutex> lock(g_MonitorMutex);
+
+    for (auto it = g_MonitoredDirs.begin(); it != g_MonitoredDirs.end(); ++it) {
+        if (it->path == path) {
+            if (it->hDir != INVALID_HANDLE_VALUE) {
+                CloseHandle(it->hDir);
+                CloseHandle(it->overlapped.hEvent);
+            }
+            g_MonitoredDirs.erase(it);
+
+            wchar_t buf[256];
+            wsprintf(buf, L"Stopped monitoring: %s", path.c_str());
+            LogToFile(buf);
+            return 0;
+        }
+    }
+
+    return 1;  // Не найдена
+}
+
+void StartMonitoring() {
+    if (g_bMonitorActive) return;
+
+    g_bMonitorActive = true;
+    g_hMonitorThread = CreateThread(NULL, 0, DirectoryMonitorThread, NULL, 0, NULL);
+    LogToFile(L"File monitoring started");
+}
+
+void StopMonitoring() {
+    g_bMonitorActive = false;
+
+    if (g_hMonitorThread) {
+        WaitForSingleObject(g_hMonitorThread, 5000);
+        CloseHandle(g_hMonitorThread);
+        g_hMonitorThread = NULL;
+    }
+
+    std::lock_guard<std::mutex> lock(g_MonitorMutex);
+    for (auto& dir : g_MonitoredDirs) {
+        if (dir.hDir != INVALID_HANDLE_VALUE) {
+            CloseHandle(dir.hDir);
+            CloseHandle(dir.overlapped.hEvent);
+        }
+    }
+    g_MonitoredDirs.clear();
+
+    LogToFile(L"File monitoring stopped");
+}
 
 std::wstring ExtractJsonValue(const std::wstring& json, const std::wstring& key) {
     std::wstring search = L"\"" + key + L"\":\"";
@@ -596,6 +998,22 @@ bool ActivateLicense(const std::wstring& code) {
             expDate.c_str());
         LogToFile(buf);
 
+        if (g_LicenseInfo->active) {
+            std::wstring dbPath = g_ServiceDirectory + L"\\av_database.bin";
+            if (LoadAvDatabase(dbPath)) {
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                wchar_t dateBuf[64];
+                wsprintf(dateBuf, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+                g_AvDbReleaseDate = dateBuf;
+                LogToFile(L"AV Database loaded successfully");
+            }
+            else {
+                LogToFile(L"AV Database not found, loading defaults...");
+                LoadDefaultAvDatabase();
+            }
+        }
+
         return g_LicenseInfo->active;
     }
 
@@ -855,6 +1273,139 @@ long ActivateProduct(handle_t h, const wchar_t* activationKey)
     return ActivateLicense(activationKey) ? 0 : 1;
 }
 
+long ScanFile(handle_t h, const wchar_t* filePath, ScanResultData* result) {
+    (void)h;
+
+    if (!result) return 1;
+
+    // Проверяем лицензию
+    {
+        std::lock_guard<std::mutex> lock(g_LicenseMutex);
+        if (!g_LicenseInfo || !g_LicenseInfo->active) return 2;
+    }
+
+    // Читаем файл
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file) return 1;
+
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+
+    // Определяем тип
+    ObjectType type = DetectFileType(data);
+
+    // Сканируем
+    ScanResult scanResult = ScanStream(data, type);
+
+    // Заполняем результат
+    result->isMalicious = scanResult.isMalicious ? 1 : 0;
+    result->recordCount = (long)scanResult.matchedRecords.size();
+    result->filePath = (wchar_t*)MIDL_user_allocate((wcslen(filePath) + 1) * sizeof(wchar_t));
+    if (result->filePath) wcscpy_s(result->filePath, wcslen(filePath) + 1, filePath);
+
+    return 0;
+}
+
+long ScanDirectory(handle_t h, const wchar_t* dirPath, ScanResultData* results, long* resultCount) {
+    (void)h;
+
+    if (!results || !resultCount) return 1;
+
+    // Проверяем лицензию
+    {
+        std::lock_guard<std::mutex> lock(g_LicenseMutex);
+        if (!g_LicenseInfo || !g_LicenseInfo->active) return 2;
+    }
+
+    *resultCount = 0;
+
+    // Сканируем все файлы в директории (упрощенно)
+    try {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(dirPath)) {
+            if (entry.is_regular_file()) {
+                // Вызываем ScanFile для каждого файла
+                ScanResultData fileResult;
+                if (ScanFile(h, entry.path().c_str(), &fileResult) == 0 && fileResult.isMalicious) {
+                    if (*resultCount < 100) { // Ограничим массив
+                        results[*resultCount] = fileResult;
+                        (*resultCount)++;
+                    }
+                }
+            }
+        }
+    }
+    catch (...) {
+        return 1;
+    }
+
+    return 0;
+}
+
+long GetAvDbInfo(handle_t h, AvDbInfo* info) {
+    (void)h;
+
+    if (!info) return 1;
+
+    std::lock_guard<std::mutex> lock(g_AvDbMutex);
+
+    info->recordCount = (long)g_AvDbRecordCount;
+    info->releaseDate = (wchar_t*)MIDL_user_allocate((g_AvDbReleaseDate.length() + 1) * sizeof(wchar_t));
+    if (info->releaseDate) wcscpy_s(info->releaseDate, g_AvDbReleaseDate.length() + 1, g_AvDbReleaseDate.c_str());
+
+    return 0;
+}
+
+// RPC-обертки для управления мониторингом
+long AddMonitoredDir(handle_t h, const wchar_t* dirPath, long recursive) {
+    (void)h;
+
+    // Проверяем лицензию
+    {
+        std::lock_guard<std::mutex> lock(g_LicenseMutex);
+        if (!g_LicenseInfo || !g_LicenseInfo->active) return 2;
+    }
+
+    return AddMonitoredDirectory(dirPath, recursive != 0);
+}
+
+long RemoveMonitoredDir(handle_t h, const wchar_t* dirPath) {
+    (void)h;
+
+    // Проверяем лицензию
+    {
+        std::lock_guard<std::mutex> lock(g_LicenseMutex);
+        if (!g_LicenseInfo || !g_LicenseInfo->active) return 2;
+    }
+
+    return RemoveMonitoredDirectory(dirPath);
+}
+
+long GetMonitoredDirs(handle_t h, wchar_t** dirList) {
+    (void)h;
+
+    if (!dirList) return 1;
+
+    // Проверяем лицензию
+    {
+        std::lock_guard<std::mutex> lock(g_LicenseMutex);
+        if (!g_LicenseInfo || !g_LicenseInfo->active) return 2;
+    }
+
+    std::lock_guard<std::mutex> lock(g_MonitorMutex);
+
+    // Формируем строку со списком директорий
+    std::wstring listStr;
+    for (const auto& dir : g_MonitoredDirs) {
+        if (!listStr.empty()) listStr += L"|";
+        listStr += dir.path;
+    }
+
+    *dirList = (wchar_t*)MIDL_user_allocate((listStr.length() + 1) * sizeof(wchar_t));
+    if (*dirList) wcscpy_s(*dirList, listStr.length() + 1, listStr.c_str());
+
+    return 0;
+}
+
 DWORD WINAPI RpcServerThreadStub(LPVOID lpParam) {
     RPC_STATUS s = RpcServerUseProtseqEpW((RPC_WSTR)L"ncalrpc", RPC_C_PROTSEQ_MAX_REQS_DEFAULT, (RPC_WSTR)L"TrayAppServiceRPC", NULL);
     if (s == RPC_S_OK || s == RPC_S_DUPLICATE_ENDPOINT) {
@@ -963,6 +1514,26 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
     LogToFile(L"ServiceMain: RUNNING");
 
+    {
+        std::wstring dbPath = g_ServiceDirectory + L"\\av_database.bin";
+        if (LoadAvDatabase(dbPath)) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            wchar_t dateBuf[64];
+            wsprintf(dateBuf, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+            g_AvDbReleaseDate = dateBuf;
+            LogToFile(L"AV Database loaded successfully from file");
+        }
+        else {
+            LogToFile(L"AV Database file not found, loading default signatures...");
+            LoadDefaultAvDatabase();
+        }
+    }
+
+    // Запускаем мониторинг директорий
+    AddMonitoredDirectory(L"C:\\Users", true);  // Мониторим домашнюю папку
+    StartMonitoring();
+
     WaitForSingleObject(g_ServiceStopEvent, INFINITE);
     LogToFile(L"ServiceMain: Stop signal received");
 
@@ -987,6 +1558,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
         hWorkerThread = NULL;
     }
 
+    StopMonitoring();
     StopAllApps();
     RpcMgmtStopServerListening(NULL);
 

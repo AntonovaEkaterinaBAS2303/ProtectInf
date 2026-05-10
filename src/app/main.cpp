@@ -61,6 +61,8 @@ NOTIFYICONDATA g_nid = {};
 UINT g_uTaskbarRestart = 0;
 bool g_bMainWindowVisible = false;
 
+HWND g_hAvDbStatus = NULL;
+
 RPC_WSTR g_StringBinding = NULL;
 handle_t g_hRpcBinding = NULL;
 
@@ -85,6 +87,42 @@ void UpdateUIState();
 void OnLogin();
 void OnLogout();
 void OnActivate();
+
+// Безопасная обертка для GetAvDbInfo (в main.cpp, перед UpdateAvDbInfo)
+static long RpcGetAvDbInfoSafe(handle_t binding, AvDbInfo* info)
+{
+    long result = 1;
+    if (info) {
+        info->releaseDate = NULL;
+        info->recordCount = 0;
+    }
+
+    RpcTryExcept
+    {
+        result = GetAvDbInfo(binding, info);
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+    }
+    RpcEndExcept
+        return result;
+}
+
+void UpdateAvDbInfo() {
+    if (!g_hRpcBinding) return;
+
+    AvDbInfo info = { 0 };
+    long result = RpcGetAvDbInfoSafe(g_hRpcBinding, &info);
+
+    if (result == 0 && info.releaseDate) {
+        wchar_t dbInfoText[512];
+        wsprintfW(dbInfoText, L"AV Database: %s | Records: %d",
+            info.releaseDate, info.recordCount);
+        SetWindowTextW(g_hAvDbStatus, dbInfoText);
+        MIDL_user_free(info.releaseDate);
+    }
+}
 
 // CRITICAL FIX: Safe RPC wrapper functions
 static long RpcLoginSafe(handle_t binding, const wchar_t* username, const wchar_t* password)
@@ -291,6 +329,9 @@ void CreateUIControls(HWND hWnd) {
 
     g_hStatusText = CreateWindowW(L"STATIC", L"",
         WS_VISIBLE | WS_CHILD, 10, 200, 350, 50, hWnd, (HMENU)IDC_STATUS_TEXT, g_hInstance, NULL);
+
+    g_hAvDbStatus = CreateWindowW(L"STATIC", L"AV Database: Not loaded",
+        WS_VISIBLE | WS_CHILD, 10, 260, 350, 25, hWnd, NULL, g_hInstance, NULL);
 }
 
 void UpdateUIState() {
@@ -369,6 +410,7 @@ void OnLogin() {
         }
 
         UpdateUIState();
+        UpdateAvDbInfo();
     }
     else {
         MessageBoxW(g_hWnd, L"Login failed. Please check your credentials.",
