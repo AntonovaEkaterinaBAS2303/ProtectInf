@@ -313,9 +313,12 @@ void LoadDefaultAvDatabase() {
     std::lock_guard<std::mutex> lock(g_AvDbMutex);
     g_AvDatabase.clear();
 
-    // Добавляем тестовую сигнатуру для EICAR (стандартный тестовый вирус)
+    // Добавляем тестовую сигнатуру для EICAR
     AvRecord eicar;
-    eicar.objectSignaturePrefix = 0x214354562D535458; // "X5O!P%@"
+
+    // Правильный префикс для "X5O!P%@A" в little-endian
+    eicar.objectSignaturePrefix = 0x41402550214F3558ULL;  // X5O!P%@A в обратном порядке байт
+
     eicar.objectSignatureLength = 8;
     eicar.objectSignature = CalculateHash(std::vector<uint8_t>{'X', '5', 'O', '!', 'P', '%', '@', 'A'});
     eicar.offsetBegin = 0;
@@ -1464,6 +1467,44 @@ long ScanFile(handle_t h, const wchar_t* filePath, ScanResultData* result) {
 
     std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
         std::istreambuf_iterator<char>());
+
+    // ОТЛАДКА: логируем первые 8 байт
+    if (data.size() >= 8) {
+        wchar_t buf[512];
+        wsprintf(buf, L"ScanFile: First 8 bytes of %s: %02X %02X %02X %02X %02X %02X %02X %02X",
+            filePath,
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+        LogToFile(buf);
+
+        // Вычисляем префикс как uint64_t
+        uint64_t prefix = 0;
+        memcpy(&prefix, data.data(), 8);
+        wsprintf(buf, L"ScanFile: Prefix as uint64: 0x%016llX", prefix);
+        LogToFile(buf);
+
+        // Вычисляем хеш первых 8 байт
+        auto hash = CalculateHash(std::vector<uint8_t>(data.begin(), data.begin() + 8));
+        wsprintf(buf, L"ScanFile: Hash of first 8 bytes: %02X%02X%02X%02X...",
+            hash[0], hash[1], hash[2], hash[3]);
+        LogToFile(buf);
+
+        // Сравниваем с хешем в базе
+        {
+            std::lock_guard<std::mutex> lock(g_AvDbMutex);
+            auto it = g_AvDatabase.find(prefix);
+            if (it != g_AvDatabase.end() && !it->second.empty()) {
+                const auto& record = it->second[0];
+                wsprintf(buf, L"ScanFile: Found in DB, DB hash: %02X%02X%02X%02X..., Match: %s",
+                    record.objectSignature[0], record.objectSignature[1],
+                    record.objectSignature[2], record.objectSignature[3],
+                    hash == record.objectSignature ? L"YES" : L"NO");
+                LogToFile(buf);
+            }
+            else {
+                LogToFile(L"ScanFile: Prefix not found in database");
+            }
+        }
+    }
 
     // Определяем тип
     ObjectType type = DetectFileType(data);

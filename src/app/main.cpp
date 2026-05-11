@@ -7,11 +7,14 @@
 #include <rpc.h>
 #include <stdlib.h> 
 #include <shlobj.h>
+#include <commdlg.h>
 #include "../common/service_rpc.h"
 
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define WM_TRAYICON (WM_APP + 1)
 #define ID_TRAY_ICON 1
@@ -117,7 +120,13 @@ void OnScanFile() {
             else {
                 msg = L"[CLEAN]\r\n";
                 msg += L"File: " + std::wstring(filePath) + L"\r\n";
+                msg += L"Scan code: " + std::to_wstring(scanRes) + L"\r\n";
             }
+            SetWindowTextW(g_hScanResults, msg.c_str());
+        }
+        else {
+            std::wstring msg = L"[ERROR]\r\n";
+            msg += L"Scan failed with code: " + std::to_wstring(scanRes) + L"\r\n";
             SetWindowTextW(g_hScanResults, msg.c_str());
         }
 
