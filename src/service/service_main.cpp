@@ -357,35 +357,14 @@ bool IsScanTarget(const std::wstring& filePath) {
 }
 
 void ProcessFileNotification(const std::wstring& filePath) {
-    // Быстрая проверка без длительных операций
-    if (!g_bMonitorActive) return;
 
     wchar_t buf[512];
-    wsprintf(buf, L"[MONITOR] File event: %s", filePath.c_str());
+    wsprintf(buf, L"[MONITOR] Checking: %s", filePath.c_str());
     LogToFile(buf);
 
-    // Проверяем существование файла
-    if (!std::filesystem::exists(filePath)) {
-        return;  // Быстрый возврат без повторных попыток
-    }
-
-    if (!std::filesystem::is_regular_file(filePath)) {
-        return;
-    }
-
-    // Проверяем размер файла
-    std::error_code ec;
-    auto fileSize = std::filesystem::file_size(filePath, ec);
-    if (ec) {
-        return;  // Ошибка получения размера
-    }
-
-    // Фильтры размера
-    const uint64_t MAX_FILE_SIZE = 100 * 1024 * 1024;
-    const uint64_t MIN_FILE_SIZE = 8;
-
-    if (fileSize > MAX_FILE_SIZE || fileSize < MIN_FILE_SIZE) {
-        return;
+    // Быстрая проверка - только расширение файла
+    if (!IsScanTarget(filePath)) {
+        return;  // Без логирования, без проверок диска
     }
 
     // Быстрая проверка лицензии
@@ -396,28 +375,52 @@ void ProcessFileNotification(const std::wstring& filePath) {
     }
 
     if (!isLicensed) {
-        return;  // Без логирования для ускорения
-    }
-
-    // Проверка расширения файла
-    if (!IsScanTarget(filePath)) {
         return;  // Без логирования
     }
 
-    // Только теперь логируем и сканируем
+    // Только теперь проверяем существование файла
+    if (!std::filesystem::exists(filePath)) {
+        return;
+    }
+
+    if (!std::filesystem::is_regular_file(filePath)) {
+        return;
+    }
+
+    // Проверяем размер файла
+    std::error_code ec;
+    auto fileSize = std::filesystem::file_size(filePath, ec);
+    if (ec) {
+        return;
+    }
+
+    const uint64_t MAX_FILE_SIZE = 100 * 1024 * 1024;
+    const uint64_t MIN_FILE_SIZE = 8;
+
+    if (fileSize > MAX_FILE_SIZE || fileSize < MIN_FILE_SIZE) {
+        return;
+    }
+
+    // Логируем и сканируем
     wsprintf(buf, L"[MONITOR] Scanning: %s (%llu bytes)", filePath.c_str(), fileSize);
     LogToFile(buf);
 
-    // Сканируем файл
     ScanResultData result = { 0 };
     long scanRes = ScanFile(NULL, filePath.c_str(), &result);
 
     if (scanRes == 0) {
         if (result.isMalicious) {
-            wsprintf(buf, L"[MALWARE DETECTED] %s - Signatures: %d",
-                filePath.c_str(), result.recordCount);
+            wsprintf(buf, L"[MALWARE DETECTED] File: %s", filePath.c_str());
+            LogToFile(buf);
+            wsprintf(buf, L"[MALWARE DETECTED] Size: %llu bytes", fileSize);
+            LogToFile(buf);
+            wsprintf(buf, L"[MALWARE DETECTED] Signatures matched: %d", result.recordCount);
             LogToFile(buf);
         }
+    }
+    else {
+        wsprintf(buf, L"[MONITOR] Scan failed with code: %d", scanRes);
+        LogToFile(buf);
     }
 
     if (result.filePath) MIDL_user_free(result.filePath);
@@ -474,7 +477,6 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
     std::vector<uint8_t> buffer(bufferSize);
 
     while (g_bMonitorActive) {
-        // Собираем изменения без длительной блокировки
         std::vector<std::wstring> filesToProcess;
 
         {
@@ -485,7 +487,6 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
 
                 DWORD bytesReturned = 0;
 
-                // Properly initialize OVERLAPPED structure
                 ZeroMemory(&dir.overlapped, sizeof(OVERLAPPED));
                 dir.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
                 if (!dir.overlapped.hEvent) continue;
@@ -505,18 +506,26 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
                 );
 
                 if (!success) {
+                    // ЛОГИРУЕМ ОШИБКУ
+                    wchar_t buf[256];
+                    wsprintf(buf, L"DirectoryMonitor: ReadDirectoryChangesW failed for %s, error=%d",
+                        dir.path.c_str(), GetLastError());
+                    LogToFile(buf);
                     CloseHandle(dir.overlapped.hEvent);
                     dir.overlapped.hEvent = NULL;
                     continue;
                 }
 
-                // Wait for changes with shorter timeout
                 DWORD waitResult = WaitForSingleObject(dir.overlapped.hEvent, 500);
 
                 if (waitResult == WAIT_OBJECT_0) {
                     DWORD bytesTransferred = 0;
                     if (GetOverlappedResult(dir.hDir, &dir.overlapped, &bytesTransferred, FALSE)) {
-                        // Собираем пути файлов, не обрабатывая их под мьютексом
+                        // ЛОГИРУЕМ КОЛИЧЕСТВО БАЙТ
+                        wchar_t buf[256];
+                        wsprintf(buf, L"DirectoryMonitor: Got %d bytes of changes", bytesTransferred);
+                        LogToFile(buf);
+
                         CollectFileChanges(dir, buffer.data(), bytesTransferred, filesToProcess);
                     }
                 }
@@ -524,15 +533,21 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam) {
                 CloseHandle(dir.overlapped.hEvent);
                 dir.overlapped.hEvent = NULL;
             }
-        } // Мьютекс освобождается здесь
+        }
 
-        // Обрабатываем файлы без блокировки мьютекса
+        // ЛОГИРУЕМ КОЛИЧЕСТВО ФАЙЛОВ ДЛЯ ОБРАБОТКИ
+        if (!filesToProcess.empty()) {
+            wchar_t buf[256];
+            wsprintf(buf, L"DirectoryMonitor: Processing %zu files", filesToProcess.size());
+            LogToFile(buf);
+        }
+
         for (const auto& filePath : filesToProcess) {
             if (!g_bMonitorActive) break;
             ProcessFileNotification(filePath);
         }
 
-        Sleep(100); // Small delay to prevent CPU spinning
+        Sleep(100);
     }
 
     LogToFile(L"DirectoryMonitor: Exiting");
@@ -550,29 +565,20 @@ void CollectFileChanges(MonitoredDirectory& dir, BYTE* buffer, DWORD bufferSize,
         std::wstring fileName(notify->FileName, notify->FileNameLength / sizeof(wchar_t));
         std::wstring fullPath = dir.path + L"\\" + fileName;
 
-        // Filter for relevant actions
         if (notify->Action == FILE_ACTION_ADDED ||
             notify->Action == FILE_ACTION_MODIFIED ||
             notify->Action == FILE_ACTION_RENAMED_NEW_NAME) {
 
-            // Skip common temporary and system directories
-            std::wstring lowerPath = fullPath;
-            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+            // ЛОГИРУЕМ ВСЕ ФАЙЛЫ
+            wchar_t buf[512];
+            wsprintf(buf, L"DirectoryMonitor: File changed: %s", fullPath.c_str());
+            LogToFile(buf);
 
-            if (lowerPath.find(L"\\appdata\\local\\temp") != std::wstring::npos ||
-                lowerPath.find(L"\\appdata\\local\\microsoft\\vsapplicationinsights") != std::wstring::npos ||
-                lowerPath.find(L"\\.minio.sys\\tmp") != std::wstring::npos ||
-                lowerPath.find(L"\\.minio.sys\\buckets") != std::wstring::npos ||
-                lowerPath.find(L"\\cookies") != std::wstring::npos ||
-                lowerPath.find(L"\\cookies-journal") != std::wstring::npos) {
-                // Пропускаем эти пути
-            }
-            else {
+            if (IsScanTarget(fullPath)) {
                 filesToProcess.push_back(fullPath);
             }
         }
 
-        // Check for next entry
         if (notify->NextEntryOffset == 0) break;
         notify = (FILE_NOTIFY_INFORMATION*)((BYTE*)notify + notify->NextEntryOffset);
     } while (true);
@@ -1812,13 +1818,25 @@ DWORD WINAPI ServiceWorkerThreadStub(LPVOID lpParam) {
         if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &ps, &ns)) {
             for (DWORD i = 0; i < ns; i++) {
                 if (ps[i].SessionId == 0) continue;
-                if (!known.count(ps[i].SessionId)) {
-                    known.insert(ps[i].SessionId);
-                    if (ps[i].State == WTSActive || ps[i].State == WTSConnected) {
-                        StartAppInSession(ps[i].SessionId);
+
+                // Проверяем, есть ли уже ЖИВОЙ процесс в этой сессии
+                bool hasRunningProcess = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_ProcessMutex);
+                    auto it = g_SessionProcesses.find(ps[i].SessionId);
+                    if (it != g_SessionProcesses.end()) {
+                        for (HANDLE h : it->second) {
+                            DWORD exitCode = 0;
+                            if (GetExitCodeProcess(h, &exitCode) && exitCode == STILL_ACTIVE) {
+                                hasRunningProcess = true;
+                                break;
+                            }
+                        }
                     }
                 }
-                else if (ps[i].State == WTSActive && !g_SessionProcesses.count(ps[i].SessionId)) {
+
+                // Запускаем только если нет живого процесса
+                if (!hasRunningProcess && ps[i].State == WTSActive) {
                     StartAppInSession(ps[i].SessionId);
                 }
             }
@@ -1900,15 +1918,20 @@ void StartAppInSession(DWORD sessionId)
         wsprintf(buf, L"StartAppInSession: Process created in session %d, PID=%d", sessionId, pi.dwProcessId);
         LogToFile(buf);
 
-        ProtectProcessFromAdmins(pi.hProcess);
+        // Ждем и проверяем, жив ли процесс
+        Sleep(3000);
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            if (exitCode == STILL_ACTIVE) {
+                LogToFile(L"StartAppInSession: TrayApp.exe is running");
+            }
+            else {
+                wsprintf(buf, L"StartAppInSession: TrayApp.exe exited with code %d", exitCode);
+                LogToFile(buf);
+            }
+        }
 
-        std::lock_guard<std::mutex> lock(g_ProcessMutex);
-        g_SessionProcesses[sessionId].push_back(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
-    else {
-        wsprintf(buf, L"StartAppInSession: CreateProcessAsUser failed, error=%d", GetLastError());
-        LogToFile(buf);
+        ProtectProcessFromAdmins(pi.hProcess);
     }
 
     if (env) DestroyEnvironmentBlock(env);

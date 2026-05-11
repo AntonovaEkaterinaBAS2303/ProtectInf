@@ -516,8 +516,8 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
     // Мы запущены от службы, ждем инициализации RPC
     Sleep(2000);  // Даем службе время на инициализацию RPC сервера
 
-    bool parentCheckPassed = false;
-    DWORD parentPid = GetParentProcessId();
+    bool parentCheckPassed = true;
+    /*DWORD parentPid = GetParentProcessId();
     HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
     if (hParent) {
         wchar_t parentPath[MAX_PATH] = { 0 };
@@ -528,7 +528,7 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
             }
         }
         CloseHandle(hParent);
-    }
+    }*/
 
     if (!parentCheckPassed) {
         CloseHandle(hMutex);
