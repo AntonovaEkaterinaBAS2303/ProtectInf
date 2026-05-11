@@ -6,6 +6,7 @@
 #include <string>
 #include <rpc.h>
 #include <stdlib.h> 
+#include <shlobj.h>
 #include "../common/service_rpc.h"
 
 #pragma comment(lib, "rpcrt4.lib")
@@ -31,6 +32,9 @@
 #define IDC_ACTIVATION_KEY_EDIT 1010
 #define IDC_ACTIVATE_BUTTON 1011
 #define IDC_STATUS_TEXT 1012
+#define IDC_SCAN_FILE_BUTTON 1013
+#define IDC_SCAN_DIR_BUTTON 1014
+#define IDC_SCAN_RESULTS 1015
 
 #define WM_UPDATE_UI (WM_APP + 2)
 #define WM_LICENSE_CHANGED (WM_APP + 3)
@@ -66,6 +70,10 @@ HWND g_hAvDbStatus = NULL;
 RPC_WSTR g_StringBinding = NULL;
 handle_t g_hRpcBinding = NULL;
 
+HWND g_hScanFileButton = NULL;
+HWND g_hScanDirButton = NULL;
+HWND g_hScanResults = NULL;
+
 // State
 bool g_bAuthenticated = false;
 bool g_bLicensed = false;
@@ -88,7 +96,66 @@ void OnLogin();
 void OnLogout();
 void OnActivate();
 
-// Безопасная обертка для GetAvDbInfo (в main.cpp, перед UpdateAvDbInfo)
+void OnScanFile() {
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+    wchar_t filePath[MAX_PATH] = { 0 };
+    ofn.lpstrFile = filePath;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileNameW(&ofn)) {
+        ScanResultData result = { 0 };
+        long scanRes = ScanFile(g_hRpcBinding, filePath, &result);
+
+        if (scanRes == 0) {
+            std::wstring msg;
+            if (result.isMalicious) {
+                msg = L"[MALWARE DETECTED]\r\n";
+                msg += L"File: " + std::wstring(result.filePath) + L"\r\n";
+                msg += L"Signatures: " + std::to_wstring(result.recordCount) + L"\r\n";
+            }
+            else {
+                msg = L"[CLEAN]\r\n";
+                msg += L"File: " + std::wstring(filePath) + L"\r\n";
+            }
+            SetWindowTextW(g_hScanResults, msg.c_str());
+        }
+
+        if (result.filePath) MIDL_user_free(result.filePath);
+    }
+}
+
+void OnScanDirectory() {
+    // Аналогично для папки
+    BROWSEINFOW bi = { 0 };
+    bi.lpszTitle = L"Select directory to scan";
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+
+    if (pidl) {
+        wchar_t dirPath[MAX_PATH];
+        SHGetPathFromIDListW(pidl, dirPath);
+
+        ScanResultData results[100] = { 0 };
+        long resultCount = 0;
+        long scanRes = ScanDirectory(g_hRpcBinding, dirPath, results, &resultCount);
+
+        if (scanRes == 0) {
+            std::wstring msg;
+            msg += L"Scanned directory: " + std::wstring(dirPath) + L"\r\n";
+            msg += L"Malicious files found: " + std::to_wstring(resultCount) + L"\r\n\r\n";
+
+            for (int i = 0; i < resultCount; i++) {
+                msg += L"• " + std::wstring(results[i].filePath) + L"\r\n";
+                MIDL_user_free(results[i].filePath);
+            }
+
+            SetWindowTextW(g_hScanResults, msg.c_str());
+        }
+
+        CoTaskMemFree(pidl);
+    }
+}
+
 static long RpcGetAvDbInfoSafe(handle_t binding, AvDbInfo* info)
 {
     long result = 1;
@@ -332,6 +399,15 @@ void CreateUIControls(HWND hWnd) {
 
     g_hAvDbStatus = CreateWindowW(L"STATIC", L"AV Database: Not loaded",
         WS_VISIBLE | WS_CHILD, 10, 260, 350, 25, hWnd, NULL, g_hInstance, NULL);
+    g_hScanFileButton = CreateWindowW(L"BUTTON", L"Scan File", WS_VISIBLE | WS_CHILD,
+        10, 295, 100, 30, hWnd, (HMENU)IDC_SCAN_FILE_BUTTON, g_hInstance, NULL);
+
+    g_hScanDirButton = CreateWindowW(L"BUTTON", L"Scan Directory", WS_VISIBLE | WS_CHILD,
+        120, 295, 120, 30, hWnd, (HMENU)IDC_SCAN_DIR_BUTTON, g_hInstance, NULL);
+
+    g_hScanResults = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER |
+        ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+        10, 335, 400, 150, hWnd, (HMENU)IDC_SCAN_RESULTS, g_hInstance, NULL);
 }
 
 void UpdateUIState() {
@@ -651,6 +727,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (LOWORD(wParam) == IDC_LOGIN_BUTTON) OnLogin();
         if (LOWORD(wParam) == IDC_LOGOUT_BUTTON) OnLogout();
         if (LOWORD(wParam) == IDC_ACTIVATE_BUTTON) OnActivate();
+        if (LOWORD(wParam) == IDC_SCAN_FILE_BUTTON) OnScanFile();
+        if (LOWORD(wParam) == IDC_SCAN_DIR_BUTTON) OnScanDirectory();
 
         if (LOWORD(wParam) == IDM_EXIT || LOWORD(wParam) == ID_FILE_EXIT)
         {
