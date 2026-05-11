@@ -6,11 +6,15 @@
 #include <string>
 #include <rpc.h>
 #include <stdlib.h> 
+#include <shlobj.h>
+#include <commdlg.h>
 #include "../common/service_rpc.h"
 
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define WM_TRAYICON (WM_APP + 1)
 #define ID_TRAY_ICON 1
@@ -31,6 +35,9 @@
 #define IDC_ACTIVATION_KEY_EDIT 1010
 #define IDC_ACTIVATE_BUTTON 1011
 #define IDC_STATUS_TEXT 1012
+#define IDC_SCAN_FILE_BUTTON 1013
+#define IDC_SCAN_DIR_BUTTON 1014
+#define IDC_SCAN_RESULTS 1015
 
 #define WM_UPDATE_UI (WM_APP + 2)
 #define WM_LICENSE_CHANGED (WM_APP + 3)
@@ -61,8 +68,14 @@ NOTIFYICONDATA g_nid = {};
 UINT g_uTaskbarRestart = 0;
 bool g_bMainWindowVisible = false;
 
+HWND g_hAvDbStatus = NULL;
+
 RPC_WSTR g_StringBinding = NULL;
 handle_t g_hRpcBinding = NULL;
+
+HWND g_hScanFileButton = NULL;
+HWND g_hScanDirButton = NULL;
+HWND g_hScanResults = NULL;
 
 // State
 bool g_bAuthenticated = false;
@@ -85,6 +98,107 @@ void UpdateUIState();
 void OnLogin();
 void OnLogout();
 void OnActivate();
+
+void OnScanFile() {
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+    wchar_t filePath[MAX_PATH] = { 0 };
+    ofn.lpstrFile = filePath;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileNameW(&ofn)) {
+        ScanResultData result = { 0 };
+        long scanRes = ScanFile(g_hRpcBinding, filePath, &result);
+
+        if (scanRes == 0) {
+            std::wstring msg;
+            if (result.isMalicious) {
+                msg = L"[MALWARE DETECTED]\r\n";
+                msg += L"File: " + std::wstring(result.filePath) + L"\r\n";
+                msg += L"Signatures: " + std::to_wstring(result.recordCount) + L"\r\n";
+            }
+            else {
+                msg = L"[CLEAN]\r\n";
+                msg += L"File: " + std::wstring(filePath) + L"\r\n";
+                msg += L"Scan code: " + std::to_wstring(scanRes) + L"\r\n";
+            }
+            SetWindowTextW(g_hScanResults, msg.c_str());
+        }
+        else {
+            std::wstring msg = L"[ERROR]\r\n";
+            msg += L"Scan failed with code: " + std::to_wstring(scanRes) + L"\r\n";
+            SetWindowTextW(g_hScanResults, msg.c_str());
+        }
+
+        if (result.filePath) MIDL_user_free(result.filePath);
+    }
+}
+
+void OnScanDirectory() {
+    // Аналогично для папки
+    BROWSEINFOW bi = { 0 };
+    bi.lpszTitle = L"Select directory to scan";
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+
+    if (pidl) {
+        wchar_t dirPath[MAX_PATH];
+        SHGetPathFromIDListW(pidl, dirPath);
+
+        ScanResultData results[100] = { 0 };
+        long resultCount = 0;
+        long scanRes = ScanDirectory(g_hRpcBinding, dirPath, results, &resultCount);
+
+        if (scanRes == 0) {
+            std::wstring msg;
+            msg += L"Scanned directory: " + std::wstring(dirPath) + L"\r\n";
+            msg += L"Malicious files found: " + std::to_wstring(resultCount) + L"\r\n\r\n";
+
+            for (int i = 0; i < resultCount; i++) {
+                msg += L"• " + std::wstring(results[i].filePath) + L"\r\n";
+                MIDL_user_free(results[i].filePath);
+            }
+
+            SetWindowTextW(g_hScanResults, msg.c_str());
+        }
+
+        CoTaskMemFree(pidl);
+    }
+}
+
+static long RpcGetAvDbInfoSafe(handle_t binding, AvDbInfo* info)
+{
+    long result = 1;
+    if (info) {
+        info->releaseDate = NULL;
+        info->recordCount = 0;
+    }
+
+    RpcTryExcept
+    {
+        result = GetAvDbInfo(binding, info);
+    }
+        RpcExcept(1)
+    {
+        result = 1;
+    }
+    RpcEndExcept
+        return result;
+}
+
+void UpdateAvDbInfo() {
+    if (!g_hRpcBinding) return;
+
+    AvDbInfo info = { 0 };
+    long result = RpcGetAvDbInfoSafe(g_hRpcBinding, &info);
+
+    if (result == 0 && info.releaseDate) {
+        wchar_t dbInfoText[512];
+        wsprintfW(dbInfoText, L"AV Database: %s | Records: %d",
+            info.releaseDate, info.recordCount);
+        SetWindowTextW(g_hAvDbStatus, dbInfoText);
+        MIDL_user_free(info.releaseDate);
+    }
+}
 
 // CRITICAL FIX: Safe RPC wrapper functions
 static long RpcLoginSafe(handle_t binding, const wchar_t* username, const wchar_t* password)
@@ -291,6 +405,18 @@ void CreateUIControls(HWND hWnd) {
 
     g_hStatusText = CreateWindowW(L"STATIC", L"",
         WS_VISIBLE | WS_CHILD, 10, 200, 350, 50, hWnd, (HMENU)IDC_STATUS_TEXT, g_hInstance, NULL);
+
+    g_hAvDbStatus = CreateWindowW(L"STATIC", L"AV Database: Not loaded",
+        WS_VISIBLE | WS_CHILD, 10, 260, 350, 25, hWnd, NULL, g_hInstance, NULL);
+    g_hScanFileButton = CreateWindowW(L"BUTTON", L"Scan File", WS_VISIBLE | WS_CHILD,
+        10, 295, 100, 30, hWnd, (HMENU)IDC_SCAN_FILE_BUTTON, g_hInstance, NULL);
+
+    g_hScanDirButton = CreateWindowW(L"BUTTON", L"Scan Directory", WS_VISIBLE | WS_CHILD,
+        120, 295, 120, 30, hWnd, (HMENU)IDC_SCAN_DIR_BUTTON, g_hInstance, NULL);
+
+    g_hScanResults = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER |
+        ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+        10, 335, 400, 150, hWnd, (HMENU)IDC_SCAN_RESULTS, g_hInstance, NULL);
 }
 
 void UpdateUIState() {
@@ -369,6 +495,7 @@ void OnLogin() {
         }
 
         UpdateUIState();
+        UpdateAvDbInfo();
     }
     else {
         MessageBoxW(g_hWnd, L"Login failed. Please check your credentials.",
@@ -466,11 +593,16 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
                 if (EnsureServiceRunning()) break;
             }
         }
+        // Запущены не от службы - просто выходим (это нормально)
+        CloseHandle(hMutex);
         return 0;
     }
 
-    bool parentCheckPassed = false;
-    DWORD parentPid = GetParentProcessId();
+    // Мы запущены от службы, ждем инициализации RPC
+    Sleep(2000);  // Даем службе время на инициализацию RPC сервера
+
+    bool parentCheckPassed = true;
+    /*DWORD parentPid = GetParentProcessId();
     HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
     if (hParent) {
         wchar_t parentPath[MAX_PATH] = { 0 };
@@ -481,12 +613,11 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
             }
         }
         CloseHandle(hParent);
-    }
+    }*/
 
     if (!parentCheckPassed) {
-        if (!EnsureServiceRunning()) {
-            return 0;
-        }
+        CloseHandle(hMutex);
+        return 0;
     }
 
     WNDCLASSEX wc = { sizeof(wc) };
@@ -494,16 +625,34 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); wc.lpszMenuName = MAKEINTRESOURCE(IDC_TRAYAPP);
     wc.lpszClassName = _T("TrayAppClass"); wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
-    if (!RegisterClassEx(&wc)) return 1;
+    if (!RegisterClassEx(&wc)) {
+        CloseHandle(hMutex);
+        return 1;
+    }
 
     g_hWnd = CreateWindow(_T("TrayAppClass"), _T("TrayApp - Antivirus"), WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, 0, 450, 350, NULL, NULL, hi, NULL);
-    if (!g_hWnd) return 1;
+    if (!g_hWnd) {
+        CloseHandle(hMutex);
+        return 1;
+    }
 
     CreateUIControls(g_hWnd);
 
-    // Initialize RPC and check initial state
-    if (InitRpcBinding()) {
+    // Инициализируем RPC с повторными попытками
+    bool rpcInitialized = false;
+    for (int retry = 0; retry < 10; retry++) {
+        if (InitRpcBinding()) {
+            rpcInitialized = true;
+            break;
+        }
+        Sleep(1000);
+    }
+
+    if (rpcInitialized) {
+        // Небольшая задержка перед первым RPC вызовом
+        Sleep(500);
+
         wchar_t* username = NULL;
         long result = RpcGetUserInfoSafe(g_hRpcBinding, &username);
 
@@ -511,7 +660,7 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
             g_bAuthenticated = true;
             wcscpy_s(g_Username, username);
 
-            // Check license
+            // Проверяем лицензию
             long daysRemaining = 0;
             wchar_t* expiryDateStr = NULL;
             long licResult = RpcGetLicenseInfoSafe(g_hRpcBinding, &daysRemaining, &expiryDateStr);
@@ -528,21 +677,26 @@ int APIENTRY _tWinMain(HINSTANCE hi, HINSTANCE, LPTSTR, int)
 
     UpdateUIState();
 
-    ShowWindow(g_hWnd, SW_HIDE);
+    // Показываем окно сразу при запуске от службы
+    ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
+    g_bMainWindowVisible = true;
 
     g_uTaskbarRestart = RegisterWindowMessage(_T("TaskbarCreated"));
     AddTrayIcon(g_hWnd);
-    g_bMainWindowVisible = false;
 
-    // Timer for periodic license check
+    // Таймер для периодической проверки лицензии
     SetTimer(g_hWnd, 1, 30000, NULL);
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
 
     KillTimer(g_hWnd, 1);
     CleanupRpcBinding();
+    CloseHandle(hMutex);
     return 0;
 }
 
@@ -582,6 +736,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (LOWORD(wParam) == IDC_LOGIN_BUTTON) OnLogin();
         if (LOWORD(wParam) == IDC_LOGOUT_BUTTON) OnLogout();
         if (LOWORD(wParam) == IDC_ACTIVATE_BUTTON) OnActivate();
+        if (LOWORD(wParam) == IDC_SCAN_FILE_BUTTON) OnScanFile();
+        if (LOWORD(wParam) == IDC_SCAN_DIR_BUTTON) OnScanDirectory();
 
         if (LOWORD(wParam) == IDM_EXIT || LOWORD(wParam) == ID_FILE_EXIT)
         {

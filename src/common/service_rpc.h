@@ -90,6 +90,47 @@ long ActivateProduct(
     /* [in] */ handle_t hBinding,
     /* [string][in] */ const wchar_t *activationKey);
 
+typedef /* [public][public][public] */ struct __MIDL_ServiceControl_0001
+    {
+    long isMalicious;
+    /* [string] */ wchar_t *filePath;
+    long recordCount;
+    } 	ScanResultData;
+
+typedef /* [public][public] */ struct __MIDL_ServiceControl_0002
+    {
+    /* [string] */ wchar_t *releaseDate;
+    long recordCount;
+    } 	AvDbInfo;
+
+long ScanFile( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *filePath,
+    /* [out] */ ScanResultData *result);
+
+long ScanDirectory( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *dirPath,
+    /* [out] */ ScanResultData *results,
+    /* [out] */ long *resultCount);
+
+long GetAvDbInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ AvDbInfo *info);
+
+long AddMonitoredDir( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *dirPath,
+    /* [in] */ long recursive);
+
+long RemoveMonitoredDir( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *dirPath);
+
+long GetMonitoredDirs( 
+    /* [in] */ handle_t hBinding,
+    /* [string][out] */ wchar_t **dirList);
+
 
 
 extern RPC_IF_HANDLE ServiceControl_v1_0_c_ifspec;

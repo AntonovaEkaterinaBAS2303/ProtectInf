@@ -15,4 +15,51 @@ interface ServiceControl
     );
     long GetLicenseInfo([in] handle_t hBinding, [out] long* daysRemaining, [out, string] wchar_t** expiryDate);
     long ActivateProduct([in] handle_t hBinding, [in, string] const wchar_t* activationKey);
+    // Результат сканирования
+    typedef struct {
+        long isMalicious;
+        [string] wchar_t* filePath;
+        long recordCount;
+    } ScanResultData;
+
+    // Информация о базах
+    typedef struct {
+        [string] wchar_t* releaseDate;
+        long recordCount;
+    } AvDbInfo;
+
+    // Новые функции
+    long ScanFile(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* filePath,
+        [out] ScanResultData* result
+    );
+
+    long ScanDirectory(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* dirPath,
+        [out] ScanResultData* results,
+        [out] long* resultCount
+    );
+
+    long GetAvDbInfo(
+        [in] handle_t hBinding,
+        [out] AvDbInfo* info
+    );
+
+    long AddMonitoredDir(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* dirPath,
+        [in] long recursive
+    );
+
+    long RemoveMonitoredDir(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* dirPath
+    );
+
+    long GetMonitoredDirs(
+        [in] handle_t hBinding,
+        [out, string] wchar_t** dirList
+    );
 }
