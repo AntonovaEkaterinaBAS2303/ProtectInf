@@ -19,12 +19,17 @@
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <stdlib.h>
+#include <wininet.h>
+#include <algorithm>  // для std::transform, std::min
+#include <ctime>      // для time_t, gmtime_s
+#include <cstring>    // для memcmp, memcpy
 
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "wininet.lib")
 
 #include "../common/service_rpc.h"
 
@@ -45,8 +50,17 @@
 #define AVDB_HASH_ALG CALG_SHA_256
 #define AVDB_SIGN_ALG CALG_RSA_SIGN
 #define AVDB_SIGN_ALG_MAGIC "RSA1"
+#define UPDATE_ENDPOINT L"/api/av/update"
+#define RECORD_ENDPOINT L"/api/av/record"
+#define UPDATE_CHECK_INTERVAL 3600000  // 1 час в миллисекундах
+#define AVDB_VERSION_URL L"/api/av/version"
+#define TEMP_KEY_CONTAINER L"TrayAppTempContainer_{12345678-1234-1234-1234-123456789012}"
 
-const char* AVDB_PUBLIC_KEY_BLOB = "---BEGIN PUBLIC KEY---\n...\n---END PUBLIC KEY---";
+
+const char* AVDB_PUBLIC_KEY_BLOB =
+"-----BEGIN PUBLIC KEY-----\n"
+"...base64...\n"
+"-----END PUBLIC KEY-----\n";
 
 extern "C" {
     void* __RPC_USER MIDL_user_allocate(size_t size)
@@ -77,36 +91,101 @@ void LogToFile(const wchar_t* msg)
 }
 
 HCRYPTKEY ImportPublicKey(const std::string& pemKey) {
-    // Для демонстрации используем встроенный тестовый публичный ключ
-    // В production здесь должен быть парсинг PEM и импорт через CryptImportPublicKeyInfo
-
     HCRYPTPROV hProv = 0;
     HCRYPTKEY hKey = 0;
 
-    // Статический тестовый ключ для проверки (RSA 2048-bit public key blob)
-    static const BYTE publicKeyBlob[] = {
-        0x06, 0x02, 0x00, 0x00, 0x00, 0xA4, 0x00, 0x00,
-        0x52, 0x53, 0x41, 0x31, 0x00, 0x08, 0x00, 0x00,
-        0x01, 0x00, 0x01, 0x00, // PUBLICKEYSTRUC + RSA key
-        // Здесь должны быть данные модуля и экспоненты
-        // Для тестового режима возвращаем заглушку, 
-        // имитирующую успешный импорт
-    };
+    // Парсим PEM
+    std::string base64Key;
+    const char* beginMarker = "-----BEGIN RSA PUBLIC KEY-----";
+    const char* endMarker = "-----END RSA PUBLIC KEY-----";
 
-    // В тестовом режиме всегда "успешно" импортируем ключ
+    size_t beginPos = pemKey.find(beginMarker);
+    size_t endPos = pemKey.find(endMarker);
+
+    if (beginPos != std::string::npos && endPos != std::string::npos) {
+        beginPos += strlen(beginMarker);
+        base64Key = pemKey.substr(beginPos, endPos - beginPos);
+        base64Key.erase(std::remove_if(base64Key.begin(), base64Key.end(),
+            [](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }),
+            base64Key.end());
+    }
+    else {
+        beginMarker = "-----BEGIN PUBLIC KEY-----";
+        endMarker = "-----END PUBLIC KEY-----";
+        beginPos = pemKey.find(beginMarker);
+        endPos = pemKey.find(endMarker);
+        if (beginPos != std::string::npos && endPos != std::string::npos) {
+            beginPos += strlen(beginMarker);
+            base64Key = pemKey.substr(beginPos, endPos - beginPos);
+            base64Key.erase(std::remove_if(base64Key.begin(), base64Key.end(),
+                [](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }),
+                base64Key.end());
+        }
+        else {
+            base64Key = pemKey;
+        }
+    }
+
+    // Декодируем base64
+    DWORD derLen = 0;
+    if (!CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
+        CRYPT_STRING_BASE64, NULL, &derLen, NULL, NULL)) {
+        LogToFile(L"[CRYPTO] Failed to decode base64");
+        return 0;
+    }
+
+    std::vector<BYTE> derKey(derLen);
+    if (!CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
+        CRYPT_STRING_BASE64, derKey.data(), &derLen, NULL, NULL)) {
+        LogToFile(L"[CRYPTO] Failed to decode base64");
+        return 0;
+    }
+
+    // ВАЖНО: Используем ВРЕМЕННЫЙ контекст (CRYPT_VERIFYCONTEXT)
     if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        DWORD err = GetLastError();
+        wchar_t buf[256];
+        wsprintf(buf, L"[CRYPTO] CryptAcquireContext failed: %d", err);
+        LogToFile(buf);
         return 0;
     }
 
-    // Создаем временный ключ для тестирования
-    if (!CryptGenKey(hProv, AT_SIGNATURE, CRYPT_EXPORTABLE, &hKey)) {
-        CryptReleaseContext(hProv, 0);
-        return 0;
+    // Импортируем ключ
+    CERT_PUBLIC_KEY_INFO* pPubKeyInfo = NULL;
+    DWORD cbPubKeyInfo = 0;
+
+    BOOL decoded = CryptDecodeObjectEx(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        X509_PUBLIC_KEY_INFO,
+        derKey.data(),
+        (DWORD)derKey.size(),
+        CRYPT_DECODE_ALLOC_FLAG,
+        NULL,
+        &pPubKeyInfo,
+        &cbPubKeyInfo
+    );
+
+    if (decoded) {
+        if (!CryptImportPublicKeyInfo(hProv, X509_ASN_ENCODING, pPubKeyInfo, &hKey)) {
+            DWORD err = GetLastError();
+            wchar_t buf[256];
+            wsprintf(buf, L"[CRYPTO] CryptImportPublicKeyInfo failed, error=%d", err);
+            LogToFile(buf);
+        }
+        else {
+            LogToFile(L"[CRYPTO] Public key imported successfully");
+        }
+        LocalFree(pPubKeyInfo);
+    }
+    else {
+        DWORD err = GetLastError();
+        wchar_t buf[256];
+        wsprintf(buf, L"[CRYPTO] CryptDecodeObjectEx failed, error=%d", err);
+        LogToFile(buf);
     }
 
-    // ВАЖНО: В реальном приложении здесь должен быть импорт публичного ключа
-    // Для демонстрации работоспособности возвращаем тестовый ключ
-
+    // НЕ освобождаем контекст, пока используется ключ
+    // CryptReleaseContext(hProv, 0); — нужно вызывать ПОСЛЕ использования ключа
     return hKey;
 }
 
@@ -162,6 +241,13 @@ struct MonitoredDirectory {
     OVERLAPPED overlapped;
 };
 
+// Добавьте определение перед использованием:
+struct ScanResultData {
+    long isMalicious;
+    long recordCount;
+    wchar_t* filePath;
+};
+
 std::vector<MonitoredDirectory> g_MonitoredDirs;
 std::mutex g_MonitorMutex;
 HANDLE g_hMonitorThread = NULL;
@@ -172,10 +258,16 @@ bool g_bMonitorActive = false;
 typedef void (*MalwareFoundCallback)(const wchar_t* filePath, const wchar_t* signatureName);
 
 // Антивирусная база (красно-чёрное дерево)
-std::map<uint64_t, std::vector<AvRecord>> g_AvDatabase;
+std::map<uint64_t, std::vector<std::shared_ptr<AvRecord>>> g_AvDatabase;
 std::mutex g_AvDbMutex;
 std::wstring g_AvDbReleaseDate;
 size_t g_AvDbRecordCount = 0;
+
+HANDLE g_hUpdateThread = NULL;
+HANDLE g_hUpdateEvent = NULL;
+bool g_bForceUpdate = false;
+std::mutex g_UpdateMutex;
+
 
 struct AuthTokens {
     std::wstring accessToken, refreshToken;
@@ -216,6 +308,15 @@ long AddMonitoredDirectory(const std::wstring& path, bool recursive);
 long RemoveMonitoredDirectory(const std::wstring& path);
 void StartMonitoring();
 void StopMonitoring();
+bool UpdateAvDatabase(const std::wstring& newDbPath);
+bool CheckForUpdates();
+DWORD WINAPI UpdateThread(LPVOID lpParam);
+std::wstring ExtractJsonValue(
+    const std::wstring& json,
+    const std::wstring& key
+);
+
+long ScanFile(handle_t h, const wchar_t* filePath, ScanResultData* result);
 
 std::vector<uint8_t> CalculateHash(const std::vector<uint8_t>& data);
 
@@ -223,57 +324,422 @@ DWORD WINAPI DirectoryMonitorThread(LPVOID lpParam);
 void ProcessFileNotification(const std::wstring& filePath);
 bool IsScanTarget(const std::wstring& filePath);
 
+// WinHTTP wrapper class
+class HttpClient {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    std::wstring host; int port; bool useHttps;
+
+public:
+    HttpClient(const std::wstring& s, int p = 8080, bool https = false) : host(s), port(p), useHttps(https) {
+        hSession = WinHttpOpen(L"TrayApp/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) {
+            wchar_t buf[128];
+            wsprintf(buf, L"HttpClient: WinHttpOpen failed, error=%d", GetLastError());
+            LogToFile(buf);
+        }
+    }
+
+    ~HttpClient() {
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+    }
+
+    bool Connect() {
+        LogToFile((L"HttpClient: Connecting to " + host + L":" + std::to_wstring(port)).c_str());
+        hConnect = WinHttpConnect(hSession, host.c_str(), (INTERNET_PORT)port, 0);
+        if (!hConnect) {
+            wchar_t buf[128];
+            wsprintf(buf, L"HttpClient: WinHttpConnect failed, error=%d", GetLastError());
+            LogToFile(buf);
+            return false;
+        }
+        LogToFile(L"HttpClient: Connected successfully");
+        return true;
+    }
+
+    bool SendRequest(const std::wstring& method, const std::wstring& path,
+        const std::wstring& body = L"", const std::wstring& auth = L"") {
+
+        DWORD flags = useHttps ? WINHTTP_FLAG_SECURE : 0;
+        hRequest = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(),
+            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+
+        if (!hRequest) {
+            wchar_t buf[128];
+            wsprintf(buf, L"HttpClient: WinHttpOpenRequest failed, error=%d", GetLastError());
+            LogToFile(buf);
+            return false;
+        }
+
+        // Устанавливаем опции безопасности ТОЛЬКО через WinHttpSetOption,
+        // используя правильные константы SECURITY_FLAG_
+        if (useHttps) {
+            DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
+                SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+                &securityFlags, sizeof(securityFlags));
+        }
+
+        // Заголовки
+        std::wstring hdrs = L"Content-Type: application/json; charset=utf-8\r\n";
+        if (!auth.empty()) {
+            hdrs += L"Authorization: Bearer " + auth + L"\r\n";
+        }
+
+        // Конвертация тела в UTF-8
+        std::string u8body;
+        if (!body.empty()) {
+            int l = WideCharToMultiByte(CP_UTF8, 0, body.c_str(),
+                (int)body.length(), NULL, 0, NULL, NULL);
+            if (l > 0) {
+                u8body.resize(l);
+                WideCharToMultiByte(CP_UTF8, 0, body.c_str(),
+                    (int)body.length(), &u8body[0], l, NULL, NULL);
+            }
+        }
+
+        LPCVOID bp = body.empty() ? WINHTTP_NO_REQUEST_DATA : u8body.c_str();
+        DWORD bl = body.empty() ? 0 : (DWORD)u8body.length();
+
+        LogToFile((L"HttpClient: Sending " + method + L" " + path).c_str());
+
+        if (!WinHttpSendRequest(hRequest, hdrs.c_str(), (DWORD)hdrs.length(),
+            (LPVOID)bp, bl, bl, 0))
+        {
+            wchar_t buf[128];
+            wsprintf(buf, L"HttpClient: WinHttpSendRequest failed, error=%d", GetLastError());
+            LogToFile(buf);
+            return false;
+        }
+
+        if (!WinHttpReceiveResponse(hRequest, NULL))
+        {
+            wchar_t buf[128];
+            wsprintf(buf, L"HttpClient: WinHttpReceiveResponse failed, error=%d", GetLastError());
+            LogToFile(buf);
+            return false;
+        }
+
+        LogToFile(L"HttpClient: Request sent and response received");
+        return true;
+    }
+
+    std::wstring GetResponse() {
+        std::wstring r;
+        DWORD s = 0, d = 0;
+        do {
+            s = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &s)) break;
+            if (s == 0) break;
+            std::vector<char> b(s + 1);
+            if (!WinHttpReadData(hRequest, b.data(), s, &d)) break;
+            if (d == 0) break;
+            int wl = MultiByteToWideChar(CP_UTF8, 0, b.data(), d, NULL, 0);
+            if (wl > 0) {
+                std::vector<wchar_t> wb(wl + 1);
+                MultiByteToWideChar(CP_UTF8, 0, b.data(), d, wb.data(), wl);
+                wb[wl] = L'\0';
+                r.append(wb.data());
+            }
+        } while (s > 0);
+        return r;
+    }
+
+    DWORD GetStatusCode() {
+        DWORD sc = 0;
+        DWORD size = sizeof(sc);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &sc, &size, WINHTTP_NO_HEADER_INDEX);
+        return sc;
+    }
+};
+
 // Функция проверки целостности блока данных
 bool VerifySignature(BYTE* data, size_t dataSize, BYTE* signature, size_t sigSize, const std::string& publicKeyBlob) {
-    // Для баз по умолчанию (пустая подпись) - всегда успешно
-    if (sigSize == 0) {
+
+    // Логируем входные параметры
+    wchar_t buf[512];
+    wsprintf(buf, L"[VERIFY] Input params: dataSize=%Iu, sigSize=%Iu", dataSize, sigSize);
+    LogToFile(buf);
+
+    // Дамп данных для отладки
+    wsprintf(buf, L"[VERIFY] Data dump (%Iu bytes):", dataSize);
+    LogToFile(buf);
+
+    std::wstring hexDump;
+    for (size_t i = 0; i < min(dataSize, (size_t)64); i++) {
+        wchar_t hex[4];
+        wsprintf(hex, L"%02X ", data[i]);
+        hexDump += hex;
+    }
+    LogToFile((LPWSTR)hexDump.c_str());
+
+    if (sigSize == 0 || signature == NULL) {
         LogToFile(L"[AVDB] Empty signature - verification skipped (default database)");
         return true;
     }
 
-    // 1. Импортировать публичный ключ из publicKeyBlob
-    HCRYPTKEY hPublicKey = ImportPublicKey(publicKeyBlob);
-    if (!hPublicKey) {
-        LogToFile(L"[AVDB] Failed to import public key for signature verification");
-        return false;
-    }
-
-    // 2. Создать хеш-объект
     HCRYPTPROV hProv = 0;
     HCRYPTHASH hHash = 0;
+    HCRYPTKEY hPublicKey = 0;
     BOOL result = FALSE;
 
+    wsprintf(buf, L"[VERIFY] Starting verification, dataSize=%Iu, sigSize=%Iu", dataSize, sigSize);
+    LogToFile(buf);
+
+    // Получаем контекст
     if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        LogToFile(L"[AVDB] CryptAcquireContext failed");
-        CryptDestroyKey(hPublicKey);
-        return false;
+        DWORD err = GetLastError();
+        wsprintf(buf, L"[VERIFY] CryptAcquireContext failed: 0x%08X", err);
+        LogToFile(buf);
+
+        // Пробуем с PROV_RSA_FULL
+        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            err = GetLastError();
+            wsprintf(buf, L"[VERIFY] All attempts failed, error=0x%08X", err);
+            LogToFile(buf);
+            return false;
+        }
+        LogToFile(L"[VERIFY] Using PROV_RSA_FULL provider");
     }
 
+    wsprintf(buf, L"[VERIFY] Context acquired: 0x%p", hProv);
+    LogToFile(buf);
+
+    // Создаем хеш - используем SHA-256 как в Python
     if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-        LogToFile(L"[AVDB] CryptCreateHash failed");
-        CryptReleaseContext(hProv, 0);
-        CryptDestroyKey(hPublicKey);
-        return false;
+        DWORD err = GetLastError();
+        wsprintf(buf, L"[VERIFY] SHA-256 failed: 0x%08X, trying SHA-1...", err);
+        LogToFile(buf);
+
+        if (!CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
+            err = GetLastError();
+            wsprintf(buf, L"[VERIFY] SHA-1 also failed: 0x%08X", err);
+            LogToFile(buf);
+            CryptReleaseContext(hProv, 0);
+            return false;
+        }
+        LogToFile(L"[VERIFY] Using SHA-1 (WARNING: Python uses SHA-256!)");
+    }
+    else {
+        LogToFile(L"[VERIFY] Using SHA-256");
     }
 
-    // 3. Вычислить хеш от данных
+    // Хешируем данные
     if (!CryptHashData(hHash, data, (DWORD)dataSize, 0)) {
-        LogToFile(L"[AVDB] CryptHashData failed");
+        DWORD err = GetLastError();
+        wsprintf(buf, L"[VERIFY] CryptHashData failed: 0x%08X", err);
+        LogToFile(buf);
         CryptDestroyHash(hHash);
         CryptReleaseContext(hProv, 0);
-        CryptDestroyKey(hPublicKey);
+        return false;
+    }
+    LogToFile(L"[VERIFY] Data hashed successfully");
+
+    // Импортируем публичный ключ
+    hPublicKey = ImportPublicKey(publicKeyBlob);
+    if (!hPublicKey) {
+        LogToFile(L"[VERIFY] Failed to import public key");
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hProv, 0);
         return false;
     }
 
-    // 4. Проверить подпись (в тестовом режиме всегда успешно)
-    // В реальном коде: CryptVerifySignature(hHash, signature, sigSize, hPublicKey, NULL, 0)
-    result = TRUE;
-    LogToFile(L"[AVDB] Signature verification SUCCESS (test mode)");
+    // Проверяем подпись (без реверсирования, т.к. Python не реверсирует)
+    result = CryptVerifySignature(hHash, signature, (DWORD)sigSize, hPublicKey, NULL, 0);
 
-    CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
-    CryptDestroyKey(hPublicKey);
-    return result;
+    if (result) {
+        LogToFile(L"[VERIFY] Signature verification SUCCESS");
+    }
+    else {
+        DWORD err = GetLastError();
+        wsprintf(buf, L"[VERIFY] Signature verification FAILED, error=0x%08X", err);
+        LogToFile(buf);
+
+        // Попробуем с реверсированной подписью
+        LogToFile(L"[VERIFY] Trying with reversed signature...");
+        std::vector<BYTE> reversedSig(sigSize);
+        for (size_t i = 0; i < sigSize; i++) {
+            reversedSig[i] = signature[sigSize - 1 - i];
+        }
+
+        // Создаем новый хеш для второй попытки
+        HCRYPTHASH hHash2 = 0;
+        CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash2);
+        CryptHashData(hHash2, data, (DWORD)dataSize, 0);
+
+        result = CryptVerifySignature(hHash2, reversedSig.data(), (DWORD)sigSize, hPublicKey, NULL, 0);
+        if (result) {
+            LogToFile(L"[VERIFY] Signature verification SUCCESS (reversed)");
+        }
+        else {
+            err = GetLastError();
+            wsprintf(buf, L"[VERIFY] Reversed signature also FAILED: 0x%08X", err);
+            LogToFile(buf);
+        }
+        CryptDestroyHash(hHash2);
+    }
+
+    // Освобождаем ресурсы
+    if (hPublicKey) CryptDestroyKey(hPublicKey);
+    if (hHash) CryptDestroyHash(hHash);
+    if (hProv) CryptReleaseContext(hProv, 0);
+
+    return result == TRUE;
+}
+
+bool CheckNetworkAvailability() {
+    DWORD flags = 0;
+    BOOL result = InternetGetConnectedState(&flags, 0);
+    return result == TRUE;
+}
+
+bool DownloadFile(const std::wstring& url, const std::wstring& localPath,
+    const std::wstring& authToken = L"") {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+
+    hSession = WinHttpOpen(L"TrayApp/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    // Парсим URL
+    URL_COMPONENTS urlComp = { 0 };
+    urlComp.dwStructSize = sizeof(urlComp);
+    wchar_t hostName[256] = { 0 }, urlPath[1024] = { 0 };
+    urlComp.lpszHostName = hostName;
+    urlComp.dwHostNameLength = 256;
+    urlComp.lpszUrlPath = urlPath;
+    urlComp.dwUrlPathLength = 1024;
+
+    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.length(), 0, &urlComp)) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    bool useHttps = (urlComp.nScheme == INTERNET_SCHEME_HTTPS);
+
+    hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD flags = useHttps ? WINHTTP_FLAG_SECURE : 0;
+    hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath, NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    // Настройка безопасности для HTTPS
+    if (useHttps) {
+        DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+            SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
+            SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+            &securityFlags, sizeof(securityFlags));
+    }
+
+    // Добавляем заголовок авторизации если есть
+    std::wstring headers = L"";
+    if (!authToken.empty()) {
+        headers = L"Authorization: Bearer " + authToken;
+    }
+
+    if (!WinHttpSendRequest(hRequest,
+        headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+        headers.empty() ? 0 : (DWORD)headers.length(),
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        goto cleanup;
+    }
+
+    if (!WinHttpReceiveResponse(hRequest, NULL)) {
+        goto cleanup;
+    }
+
+    DWORD statusCode = 0;
+    DWORD size = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &size, WINHTTP_NO_HEADER_INDEX);
+
+    if (statusCode != 200) goto cleanup;
+
+    {
+        std::ofstream file(localPath, std::ios::binary);
+        if (!file) goto cleanup;
+
+        DWORD dwSize = 0;
+        DWORD dwDownloaded = 0;
+        do {
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+            if (dwSize == 0) break;
+
+            std::vector<BYTE> buffer(dwSize);
+            if (!WinHttpReadData(hRequest, buffer.data(), dwSize, &dwDownloaded)) break;
+            if (dwDownloaded == 0) break;
+
+            file.write((char*)buffer.data(), dwDownloaded);
+        } while (true);
+
+        file.close();
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return true;
+    }
+
+cleanup:
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+    return false;
+}
+
+std::wstring GetServerVersion(const std::wstring& authToken) {
+    HttpClient c(API_HOST, API_PORT, API_USE_HTTPS);
+    if (!c.Connect()) return L"";
+    if (!c.SendRequest(L"GET", AVDB_VERSION_URL, L"", authToken)) return L"";
+
+    DWORD status = c.GetStatusCode();
+    if (status != 200) return L"";
+
+    std::wstring response = c.GetResponse();
+    return ExtractJsonValue(response, L"version");
+}
+
+long GetServerRecord(handle_t h, const wchar_t* filePath, AvRecord* record) {
+    (void)h;
+    if (!record) return 1;
+
+    std::wstring authToken;
+    {
+        std::lock_guard<std::mutex> lock(g_AuthMutex);
+        if (!g_AuthTokens) return 1;
+        authToken = g_AuthTokens->accessToken;
+    }
+
+    if (!CheckNetworkAvailability()) return 1;
+
+    HttpClient c(API_HOST, API_PORT, API_USE_HTTPS);
+    if (!c.Connect()) return 1;
+
+    // Формируем запрос
+    std::wstring body = L"{\"filePath\":\"" + std::wstring(filePath) + L"\"}";
+    if (!c.SendRequest(L"POST", RECORD_ENDPOINT, body, authToken)) return 1;
+
+    if (c.GetStatusCode() != 200) return 1;
+
+    std::wstring response = c.GetResponse();
+
+    return 0;
 }
 
 void LoadDefaultAvDatabase() {
@@ -281,44 +747,43 @@ void LoadDefaultAvDatabase() {
     g_AvDatabase.clear();
     g_AvDbRecordCount = 0;
 
-    // EICAR тестовый файл - только первые 8 байт для поиска
+    // EICAR тестовый файл
     {
-        AvRecord eicar;
-        eicar.objectSignaturePrefix = 0x41402550214F3558ULL; // "X5O!P%@A" в little-endian
-        eicar.objectSignatureLength = 8;
-        // Хеш ТОЛЬКО от первых 8 байт
-        eicar.objectSignature = CalculateHash(std::vector<uint8_t>{'X', '5', 'O', '!', 'P', '%', '@', 'A'});
-        eicar.offsetBegin = 0;
-        eicar.offsetEnd = 68; // Полная длина EICAR-строки
-        eicar.objectType = ObjectType::PE_FILE;
-        eicar.avRecordSignature.clear();
-        g_AvDatabase[eicar.objectSignaturePrefix].push_back(eicar);
+        auto eicar = std::make_shared<AvRecord>();
+        eicar->objectSignaturePrefix = 0x41402550214F3558ULL;
+        eicar->objectSignatureLength = 8;
+        eicar->objectSignature = CalculateHash(std::vector<uint8_t>{'X', '5', 'O', '!', 'P', '%', '@', 'A'});
+        eicar->offsetBegin = 0;
+        eicar->offsetEnd = 68;
+        eicar->objectType = ObjectType::PE_FILE;
+        eicar->avRecordSignature.clear();
+        g_AvDatabase[eicar->objectSignaturePrefix].push_back(eicar);
     }
 
     // PowerShell тестовая строка
     {
-        AvRecord ps;
-        ps.objectSignaturePrefix = 0x53207265776F5000ULL; // "PowerS" в little-endian
-        ps.objectSignatureLength = 8;
-        ps.objectSignature = CalculateHash(std::vector<uint8_t>{'P', 'o', 'w', 'e', 'r', 'S', 'h', 'e'});
-        ps.offsetBegin = 0;
-        ps.offsetEnd = 23; // Полная длина тестовой строки
-        ps.objectType = ObjectType::POWERSHELL;
-        ps.avRecordSignature.clear();
-        g_AvDatabase[ps.objectSignaturePrefix].push_back(ps);
+        auto ps = std::make_shared<AvRecord>();
+        ps->objectSignaturePrefix = 0x53207265776F5000ULL;
+        ps->objectSignatureLength = 8;
+        ps->objectSignature = CalculateHash(std::vector<uint8_t>{'P', 'o', 'w', 'e', 'r', 'S', 'h', 'e'});
+        ps->offsetBegin = 0;
+        ps->offsetEnd = 23;
+        ps->objectType = ObjectType::POWERSHELL;
+        ps->avRecordSignature.clear();
+        g_AvDatabase[ps->objectSignaturePrefix].push_back(ps);
     }
 
     // BAT тестовый файл
     {
-        AvRecord bat;
-        bat.objectSignaturePrefix = 0x206F6863654045ULL; // "@echo " в little-endian
-        bat.objectSignatureLength = 8;
-        bat.objectSignature = CalculateHash(std::vector<uint8_t>{'@', 'e', 'c', 'h', 'o', ' ', 'V', 'i'});
-        bat.offsetBegin = 0;
-        bat.offsetEnd = 16; // Полная длина тестовой строки
-        bat.objectType = ObjectType::PE_FILE;
-        bat.avRecordSignature.clear();
-        g_AvDatabase[bat.objectSignaturePrefix].push_back(bat);
+        auto bat = std::make_shared<AvRecord>();
+        bat->objectSignaturePrefix = 0x206F6863654045ULL;
+        bat->objectSignatureLength = 8;
+        bat->objectSignature = CalculateHash(std::vector<uint8_t>{'@', 'e', 'c', 'h', 'o', ' ', 'V', 'i'});
+        bat->offsetBegin = 0;
+        bat->offsetEnd = 16;
+        bat->objectType = ObjectType::PE_FILE;
+        bat->avRecordSignature.clear();
+        g_AvDatabase[bat->objectSignaturePrefix].push_back(bat);
     }
 
     g_AvDbRecordCount = 3;
@@ -332,63 +797,203 @@ void LoadDefaultAvDatabase() {
     LogToFile(L"[AVDB] Default database loaded with 3 records");
 }
 
+// Вспомогательная функция для логирования hex-дампа
+void LogHexDump(const wchar_t* prefix, const uint8_t* data, size_t size) {
+    std::wstring dump = prefix;
+    wchar_t hex[4];
+    for (size_t i = 0; i < min(size, (size_t)64); i++) {
+        wsprintf(hex, L"%02X ", data[i]);
+        dump += hex;
+    }
+    if (size > 64) {
+        dump += L"...";
+    }
+    LogToFile((LPWSTR)dump.c_str());
+}
+
 // Загрузка антивирусных записей с проверкой ЭЦП каждой записи
 bool LoadRecords(std::ifstream& file, const AVDB_MANIFEST& manifest, const std::string& publicKey) {
     std::lock_guard<std::mutex> lock(g_AvDbMutex);
     g_AvDatabase.clear();
     g_AvDbRecordCount = 0;
 
-    wchar_t buf[256];
+    wchar_t buf[512];
     unsigned int loadedCount = 0;
     unsigned int discardedCount = 0;
+    unsigned int networkRequested = 0;
+
+    wsprintf(buf, L"[AVDB] Loading %u records...", manifest.recordCount);
+    LogToFile(buf);
 
     for (uint32_t i = 0; i < manifest.recordCount; ++i) {
         AvRecord record;
 
-        // Чтение обязательных полей
+        // 1. Читаем префикс (8 байт)
         file.read((char*)&record.objectSignaturePrefix, 8);
-        file.read((char*)&record.objectSignatureLength, 4);
-
-        record.objectSignature.resize(record.objectSignatureLength);
-        file.read((char*)record.objectSignature.data(), record.objectSignatureLength);
-
-        file.read((char*)&record.offsetBegin, 8);
-        file.read((char*)&record.offsetEnd, 8);
-        file.read((char*)&record.objectType, sizeof(ObjectType));
-
-        // Чтение подписи записи
-        uint32_t sigLen = 0;
-        file.read((char*)&sigLen, 4);
-        record.avRecordSignature.resize(sigLen);
-        file.read((char*)record.avRecordSignature.data(), sigLen);
-
-        // Подготовка данных для проверки подписи
-        std::vector<uint8_t> recordData;
-        recordData.insert(recordData.end(), (uint8_t*)&record.objectSignaturePrefix, (uint8_t*)&record.objectSignaturePrefix + 8);
-        recordData.insert(recordData.end(), (uint8_t*)&record.objectSignatureLength, (uint8_t*)&record.objectSignatureLength + 4);
-        recordData.insert(recordData.end(), record.objectSignature.begin(), record.objectSignature.end());
-        recordData.insert(recordData.end(), (uint8_t*)&record.offsetBegin, (uint8_t*)&record.offsetBegin + 8);
-        recordData.insert(recordData.end(), (uint8_t*)&record.offsetEnd, (uint8_t*)&record.offsetEnd + 8);
-        recordData.insert(recordData.end(), (uint8_t*)&record.objectType, (uint8_t*)&record.objectType + sizeof(ObjectType));
-
-        // Проверка ЭЦП записи (Требование 7)
-        if (!VerifySignature(recordData.data(), recordData.size(), record.avRecordSignature.data(), sigLen, publicKey)) {
-            wsprintf(buf, L"[AVDB] Record %d signature INVALID. Discarding.", i);
+        if (file.fail()) {
+            wsprintf(buf, L"[AVDB] Failed to read prefix for record %u", i);
             LogToFile(buf);
-            discardedCount++;
-            continue; // Пропустить запись, продолжить загрузку
+            break;
         }
 
+        // 2. Читаем длину сигнатуры (4 байта)
+        file.read((char*)&record.objectSignatureLength, 4);
+        if (file.fail()) {
+            wsprintf(buf, L"[AVDB] Failed to read signature length for record %u", i);
+            LogToFile(buf);
+            break;
+        }
+
+        // 3. Читаем саму сигнатуру (переменная длина)
+        if (record.objectSignatureLength > 0 && record.objectSignatureLength < 1024 * 1024) {
+            record.objectSignature.resize(record.objectSignatureLength);
+            file.read((char*)record.objectSignature.data(), record.objectSignatureLength);
+            if (file.fail()) {
+                wsprintf(buf, L"[AVDB] Failed to read signature data for record %u (length=%u)",
+                    i, record.objectSignatureLength);
+                LogToFile(buf);
+                break;
+            }
+        }
+        else {
+            wsprintf(buf, L"[AVDB] Invalid signature length for record %u: %u",
+                i, record.objectSignatureLength);
+            LogToFile(buf);
+            discardedCount++;
+            continue;
+        }
+
+        // 4. Читаем offsetBegin (8 байт)
+        file.read((char*)&record.offsetBegin, 8);
+        if (file.fail()) {
+            wsprintf(buf, L"[AVDB] Failed to read offsetBegin for record %u", i);
+            LogToFile(buf);
+            break;
+        }
+
+        // 5. Читаем offsetEnd (8 байт)
+        file.read((char*)&record.offsetEnd, 8);
+        if (file.fail()) {
+            wsprintf(buf, L"[AVDB] Failed to read offsetEnd for record %u", i);
+            LogToFile(buf);
+            break;
+        }
+
+        // 6. Читаем objectType (4 байта)
+        file.read((char*)&record.objectType, sizeof(ObjectType));
+        if (file.fail()) {
+            wsprintf(buf, L"[AVDB] Failed to read objectType for record %u", i);
+            LogToFile(buf);
+            break;
+        }
+
+        // 7. Читаем длину подписи записи (4 байта)
+        uint32_t sigLen = 0;
+        file.read((char*)&sigLen, 4);
+        if (file.fail()) {
+            wsprintf(buf, L"[AVDB] Failed to read record signature length for record %u", i);
+            LogToFile(buf);
+            break;
+        }
+
+        // 8. Читаем подпись записи
+        if (sigLen > 0 && sigLen < 1024) {
+            record.avRecordSignature.resize(sigLen);
+            file.read((char*)record.avRecordSignature.data(), sigLen);
+            if (file.fail()) {
+                wsprintf(buf, L"[AVDB] Failed to read record signature for record %u", i);
+                LogToFile(buf);
+                break;
+            }
+        }
+        else {
+            wsprintf(buf, L"[AVDB] Invalid record signature length for record %u: %u",
+                i, sigLen);
+            LogToFile(buf);
+            discardedCount++;
+            continue;
+        }
+
+        // Логируем информацию о записи
+        wsprintf(buf, L"[AVDB] Record %u: prefix=0x%016llX, sigLen=%u, offsets=[%llu,%llu], type=%u",
+            i, record.objectSignaturePrefix, record.objectSignatureLength,
+            record.offsetBegin, record.offsetEnd, (unsigned int)record.objectType);
+        LogToFile(buf);
+
+        // Подготовка данных для проверки подписи
+        // ВАЖНО: порядок и размер полей должны точно соответствовать Python!
+        std::vector<uint8_t> recordData;
+
+        // prefix (8 байт)
+        recordData.insert(recordData.end(),
+            (uint8_t*)&record.objectSignaturePrefix,
+            (uint8_t*)&record.objectSignaturePrefix + 8);
+
+        // signatureLength (4 байта)
+        recordData.insert(recordData.end(),
+            (uint8_t*)&record.objectSignatureLength,
+            (uint8_t*)&record.objectSignatureLength + 4);
+
+        // signature data (переменная длина)
+        recordData.insert(recordData.end(),
+            record.objectSignature.begin(),
+            record.objectSignature.end());
+
+        // offsetBegin (8 байт)
+        recordData.insert(recordData.end(),
+            (uint8_t*)&record.offsetBegin,
+            (uint8_t*)&record.offsetBegin + 8);
+
+        // offsetEnd (8 байт)
+        recordData.insert(recordData.end(),
+            (uint8_t*)&record.offsetEnd,
+            (uint8_t*)&record.offsetEnd + 8);
+
+        // objectType (4 байта)
+        recordData.insert(recordData.end(),
+            (uint8_t*)&record.objectType,
+            (uint8_t*)&record.objectType + sizeof(ObjectType));
+
+        // Логируем размер данных и их начало
+        wsprintf(buf, L"[AVDB] Record %u data size: %Iu bytes", i, recordData.size());
+        LogToFile(buf);
+        LogHexDump(L"[AVDB] Record data hex: ", recordData.data(), recordData.size());
+
+        // Проверка ЭЦП записи
+        if (!VerifySignature(recordData.data(), recordData.size(),
+            record.avRecordSignature.data(), sigLen, publicKey)) {
+            wsprintf(buf, L"[AVDB] Record %u signature INVALID.", i);
+            LogToFile(buf);
+
+            // Запрос записи с сервера при наличии сети
+            if (CheckNetworkAvailability()) {
+                wsprintf(buf, L"[AVDB] Attempting to fetch record %u from server...", i);
+                LogToFile(buf);
+                // TODO: Реализовать запрос к серверу
+                networkRequested++;
+            }
+
+            discardedCount++;
+            continue;
+        }
+
+        // Логируем сигнатуру для сверки
+        wsprintf(buf, L"[AVDB] Record %u signature VERIFIED successfully", i);
+        LogToFile(buf);
+        LogHexDump(L"[AVDB] Signature first bytes: ",
+            record.avRecordSignature.data(), min(record.avRecordSignature.size(), (size_t)32));
+
         // Добавление записи в базу
-        g_AvDatabase[record.objectSignaturePrefix].push_back(record);
+        g_AvDatabase[record.objectSignaturePrefix].push_back(std::make_shared<AvRecord>(std::move(record)));
         loadedCount++;
     }
 
     g_AvDbRecordCount = loadedCount;
-    wsprintf(buf, L"[AVDB] Records loaded: %d valid, %d discarded.", loadedCount, discardedCount);
+    wsprintf(buf, L"[AVDB] Records loaded: %u valid, %u discarded, %u requested from network",
+        loadedCount, discardedCount, networkRequested);
     LogToFile(buf);
 
-    return true; // Даже если все записи были отброшены, база все равно "загружена" (пустой)
+    return loadedCount > 0;
 }
 
 // Основная функция загрузки базы с обработкой всех ошибок
@@ -398,25 +1003,44 @@ bool LoadAndVerifyAvDatabase(const std::wstring& dbPath, const std::wstring& pub
     std::wstring primaryPath = dbPath;
     std::wstring backupPath = dbPath + L".bak";
 
-    // Загрузка публичного ключа из файла или из встроенных ресурсов
-    // TODO: Заменить на чтение из файла publicKeyPath
+    // Загружаем публичный ключ из файла
     std::string publicKeyBlob = AVDB_PUBLIC_KEY_BLOB;
+
+    // Пытаемся прочитать ключ из файла
+    std::ifstream keyFile(publicKeyPath);
+    if (keyFile) {
+        std::stringstream buffer;
+        buffer << keyFile.rdbuf();
+        publicKeyBlob = buffer.str();
+        keyFile.close();
+        LogToFile(L"[AVDB] Public key loaded from file");
+    }
+    else {
+        LogToFile(L"[AVDB] Using built-in public key");
+    }
 
     // Попытка загрузить основную базу
     std::ifstream file(primaryPath, std::ios::binary);
     if (!file) {
         LogToFile(L"[AVDB] Primary database not found. Check backup.");
-        // Основная не найдена, пробуем бэкап
         file.open(backupPath, std::ios::binary);
         if (file) {
             LogToFile(L"[AVDB] Loading backup database...");
-            primaryPath = backupPath; // Обновляем путь для возможного восстановления
+            primaryPath = backupPath;
         }
         else {
-            // (Требование 6) Нет ни основной, ни бэкапной - загружаем дефолтную.
+            // Требование 6: Загружаем базу по умолчанию
             LogToFile(L"[AVDB] Backup not found. Loading default database.");
             LoadDefaultAvDatabase();
-            return true; // Не ошибка, база загружена по умолчанию
+
+            // Если есть сеть, пытаемся обновить базы
+            if (CheckNetworkAvailability()) {
+                LogToFile(L"[AVDB] Network available, attempting forced update...");
+                // Запускаем принудительное обновление в фоне
+                SetEvent(g_hUpdateEvent);
+            }
+
+            return true;
         }
     }
 
@@ -443,19 +1067,33 @@ bool LoadAndVerifyAvDatabase(const std::wstring& dbPath, const std::wstring& pub
         LogToFile(L"[AVDB] Manifest signature INVALID!");
         file.close();
 
-        // (Требование 5) Попытка восстановить базу из бэкапа или принудительное обновление.
+        // Требование 5: Попытка восстановить из бэкапа
         if (primaryPath == backupPath) {
-            // Мы уже пытались загрузить бэкап и он тоже невалиден -> дефолтная база
-            LogToFile(L"[AVDB] Backup manifest is invalid. Loading default database.");
-            LoadDefaultAvDatabase();
-            return true;
+            LogToFile(L"[AVDB] Backup manifest is also invalid.");
+
+            // Проверяем наличие сети
+            if (CheckNetworkAvailability()) {
+                LogToFile(L"[AVDB] Network available, forcing update...");
+                // Запускаем принудительное обновление
+                SetEvent(g_hUpdateEvent);
+
+                // Временно загружаем базу по умолчанию
+                LoadDefaultAvDatabase();
+                return true;
+            }
+            else {
+                // Загружаем базу по умолчанию
+                LogToFile(L"[AVDB] No network, loading default database.");
+                LoadDefaultAvDatabase();
+                return true;
+            }
         }
         else {
-            // Попробуем удалить поврежденный файл и загрузить бэкап
+            // Пробуем удалить поврежденный файл и загрузить бэкап
             LogToFile(L"[AVDB] Trying to recover from backup...");
             std::error_code ec;
             std::filesystem::remove(primaryPath, ec);
-            return LoadAndVerifyAvDatabase(dbPath, publicKeyPath); // Рекурсивный вызов для загрузки бэкапа
+            return LoadAndVerifyAvDatabase(dbPath, publicKeyPath);
         }
     }
 
@@ -466,24 +1104,180 @@ bool LoadAndVerifyAvDatabase(const std::wstring& dbPath, const std::wstring& pub
     struct tm stm;
     gmtime_s(&stm, &time);
     wchar_t dateBuf[64];
-    wsprintf(dateBuf, L"%04d-%02d-%02dT%02d:%02d:%02dZ", stm.tm_year + 1900, stm.tm_mon + 1, stm.tm_mday, stm.tm_hour, stm.tm_min, stm.tm_sec);
-    g_AvDbReleaseDate = dateBuf;
+    wsprintf(dateBuf, L"%04d-%02d-%02dT%02d:%02d:%02dZ",
+        stm.tm_year + 1900, stm.tm_mon + 1, stm.tm_mday,
+        stm.tm_hour, stm.tm_min, stm.tm_sec);
+    {
+        std::lock_guard<std::mutex> lock(g_AvDbMutex);
+        g_AvDbReleaseDate = dateBuf;
+    }
 
     // Загрузка записей с проверкой их ЭЦП (Требование 7)
     LoadRecords(file, manifest, publicKeyBlob);
-
     file.close();
 
-    // Создание резервной копии успешно загруженной базы (на будущее)
+    // Создание резервной копии успешно загруженной базы
     if (primaryPath == dbPath) {
         std::error_code ec;
-        std::filesystem::copy_file(dbPath, backupPath, std::filesystem::copy_options::overwrite_existing, ec);
-        if (ec) {
-            LogToFile(L"[AVDB] Failed to create backup copy.");
+        std::filesystem::copy_file(dbPath, backupPath,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) {
+            LogToFile(L"[AVDB] Backup copy created successfully.");
         }
     }
 
     return true;
+}
+
+bool CheckForUpdates() {
+    LogToFile(L"[UPDATE] Checking for database updates...");
+
+    if (!CheckNetworkAvailability()) {
+        LogToFile(L"[UPDATE] No network available");
+        return false;
+    }
+
+    std::wstring authToken;
+    {
+        std::lock_guard<std::mutex> lock(g_AuthMutex);
+        if (!g_AuthTokens) {
+            LogToFile(L"[UPDATE] No auth token");
+            return false;
+        }
+        authToken = g_AuthTokens->accessToken;
+    }
+
+    // Получаем версию с сервера
+    std::wstring serverVersion = GetServerVersion(authToken);
+    if (serverVersion.empty()) {
+        LogToFile(L"[UPDATE] Failed to get server version");
+        return false;
+    }
+
+    // Сравниваем с локальной версией
+    std::wstring localVersion;
+    {
+        std::lock_guard<std::mutex> lock(g_AvDbMutex);
+        localVersion = g_AvDbReleaseDate;
+    }
+
+    if (serverVersion > localVersion || g_bForceUpdate) {
+        LogToFile(L"[UPDATE] New version available, updating...");
+
+        // Скачиваем новую базу
+        std::wstring tempPath = g_ServiceDirectory + L"\\av_database_new.bin";
+        std::wstring updateUrl = std::wstring(API_USE_HTTPS ? L"https://" : L"http://") +
+            std::wstring(API_HOST) + L":" + std::to_wstring(API_PORT) +
+            UPDATE_ENDPOINT;
+
+        if (DownloadFile(updateUrl, tempPath, authToken)) {
+            LogToFile(L"[UPDATE] New database downloaded");
+
+            // Обновляем через существующую функцию
+            if (UpdateAvDatabase(tempPath)) {
+                std::filesystem::remove(tempPath);
+                g_bForceUpdate = false;
+                LogToFile(L"[UPDATE] Database updated successfully");
+                return true;
+            }
+        }
+    }
+    else {
+        LogToFile(L"[UPDATE] Database is up to date");
+    }
+
+    return false;
+}
+
+DWORD WINAPI UpdateThread(LPVOID lpParam) {
+    (void)lpParam;
+    LogToFile(L"[UPDATE] Update thread started");
+
+    // Первая проверка через 30 секунд после запуска
+    Sleep(30000);
+
+    while (!g_bStopRefreshThreads) {
+        // Ждем либо интервал, либо сигнал принудительного обновления
+        DWORD waitResult = WaitForSingleObject(g_hUpdateEvent, UPDATE_CHECK_INTERVAL);
+
+        if (g_bStopRefreshThreads) break;
+
+        // Проверяем обновления либо по таймеру, либо по сигналу
+        if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT) {
+            bool hasLicense = false;
+            {
+                std::lock_guard<std::mutex> lock(g_LicenseMutex);
+                hasLicense = (g_LicenseInfo && g_LicenseInfo->active);
+            }
+
+            if (hasLicense) {
+                CheckForUpdates();
+            }
+
+            // Сбрасываем событие после обработки
+            if (waitResult == WAIT_OBJECT_0) {
+                ResetEvent(g_hUpdateEvent);
+            }
+        }
+    }
+
+    LogToFile(L"[UPDATE] Update thread stopped");
+    return 0;
+}
+
+bool TryLoadAvDatabaseStrict(const std::wstring& dbPath) {
+    std::wstring publicKeyPath = g_ServiceDirectory + L"\\public_key_cryptoapi.pem";
+
+    std::ifstream file(dbPath, std::ios::binary);
+    if (!file) {
+        LogToFile(L"[AVDB] Strict load failed: database file not found");
+        return false;
+    }
+
+    std::string publicKeyBlob = AVDB_PUBLIC_KEY_BLOB;
+
+    std::ifstream keyFile(publicKeyPath);
+    if (keyFile) {
+        std::stringstream buffer;
+        buffer << keyFile.rdbuf();
+        publicKeyBlob = buffer.str();
+    }
+
+    AVDB_MANIFEST manifest;
+    file.read((char*)manifest.magic, 4);
+    file.read((char*)&manifest.version, 4);
+    file.read((char*)&manifest.releaseTimestamp, 8);
+    file.read((char*)&manifest.recordCount, 4);
+    file.read((char*)&manifest.reserved, 4);
+    file.read((char*)&manifest.signatureSize, 4);
+
+    if (!file || memcmp(manifest.magic, "AVDB", 4) != 0) {
+        LogToFile(L"[AVDB] Strict load failed: invalid manifest header");
+        return false;
+    }
+
+    if (manifest.signatureSize == 0 || manifest.signatureSize > 4096) {
+        LogToFile(L"[AVDB] Strict load failed: invalid manifest signature size");
+        return false;
+    }
+
+    manifest.signature.resize(manifest.signatureSize);
+    file.read((char*)manifest.signature.data(), manifest.signatureSize);
+
+    auto dataToSign = manifest.GetDataToSign();
+
+    if (!VerifySignature(
+        dataToSign.data(),
+        dataToSign.size(),
+        manifest.signature.data(),
+        manifest.signatureSize,
+        publicKeyBlob
+    )) {
+        LogToFile(L"[AVDB] Strict load failed: manifest signature invalid");
+        return false;
+    }
+
+    return LoadRecords(file, manifest, publicKeyBlob);
 }
 
 // Функция обновления базы с резервированием и откатом (Необязательные требования 2-4)
@@ -511,14 +1305,14 @@ bool UpdateAvDatabase(const std::wstring& newDbPath) {
     }
 
     // Загрузка обновленной базы
-    bool loaded = LoadAndVerifyAvDatabase(currentDbPath, g_ServiceDirectory + L"\\public_key.pem");
+    bool loaded = TryLoadAvDatabaseStrict(currentDbPath);
 
     if (!loaded) {
         LogToFile(L"[AVDB] Failed to load updated database. Rolling back...");
         // Откат к резервной копии (Требование 4)
         std::filesystem::copy_file(backupPath, currentDbPath, std::filesystem::copy_options::overwrite_existing, ec);
         if (!ec) {
-            LoadAndVerifyAvDatabase(currentDbPath, g_ServiceDirectory + L"\\public_key.pem");
+            TryLoadAvDatabaseStrict(currentDbPath);
         }
     }
 
@@ -588,7 +1382,6 @@ ScanResult ScanStream(const std::vector<uint8_t>& data, ObjectType fileType) {
     size_t position = 0;
 
     while (position <= data.size() - 8) {
-        // 3.2: Считать 8 байт и найти в дереве
         uint64_t prefix = 0;
         memcpy(&prefix, data.data() + position, 8);
 
@@ -596,19 +1389,16 @@ ScanResult ScanStream(const std::vector<uint8_t>& data, ObjectType fileType) {
         auto it = g_AvDatabase.find(prefix);
 
         if (it != g_AvDatabase.end()) {
-            std::vector<AvRecord> candidates = it->second;
+            // Работаем с shared_ptr
+            for (const auto& recordPtr : it->second) {
+                const auto& record = *recordPtr;  // Разыменовываем для удобства
 
-            // 3.3: Проверить каждую запись
-            for (const auto& record : candidates) {
-                // 3.3.1: Проверить тип объекта
                 if (record.objectType != fileType)
                     continue;
 
-                // 3.3.2: Проверить диапазон
                 if (position < record.offsetBegin || position > record.offsetEnd)
                     continue;
 
-                // 3.3.3: Считать дополнительные байты
                 if (position + record.objectSignatureLength > data.size())
                     continue;
 
@@ -617,22 +1407,18 @@ ScanResult ScanStream(const std::vector<uint8_t>& data, ObjectType fileType) {
                     data.begin() + position + record.objectSignatureLength
                 );
 
-                // 3.3.4: Подсчитать хеш
                 auto hash = CalculateHash(signatureData);
 
-                // 3.3.5: Сравнить хеши
                 if (hash == record.objectSignature) {
                     result.isMalicious = true;
-                    result.matchedRecords.push_back(record);
+                    result.matchedRecords.push_back(record);  // Копируем для результата
                 }
             }
 
-            // 3.6: Найдено совпадение
             if (result.isMalicious)
                 break;
         }
 
-        // 3.5: Сдвинуть позицию на 1 байт
         position++;
     }
 
@@ -1035,139 +1821,6 @@ std::chrono::system_clock::time_point ParseExpirationDate(const std::wstring& ex
     LogToFile(L"ParseExpirationDate: Failed to parse, using default +1 year");
     return std::chrono::system_clock::now() + std::chrono::hours(8760);
 }
-
-// WinHTTP wrapper class
-class HttpClient {
-    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
-    std::wstring host; int port; bool useHttps;
-
-public:
-    HttpClient(const std::wstring& s, int p = 8080, bool https = false) : host(s), port(p), useHttps(https) {
-        hSession = WinHttpOpen(L"TrayApp/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) {
-            wchar_t buf[128];
-            wsprintf(buf, L"HttpClient: WinHttpOpen failed, error=%d", GetLastError());
-            LogToFile(buf);
-        }
-    }
-
-    ~HttpClient() {
-        if (hRequest) WinHttpCloseHandle(hRequest);
-        if (hConnect) WinHttpCloseHandle(hConnect);
-        if (hSession) WinHttpCloseHandle(hSession);
-    }
-
-    bool Connect() {
-        LogToFile((L"HttpClient: Connecting to " + host + L":" + std::to_wstring(port)).c_str());
-        hConnect = WinHttpConnect(hSession, host.c_str(), (INTERNET_PORT)port, 0);
-        if (!hConnect) {
-            wchar_t buf[128];
-            wsprintf(buf, L"HttpClient: WinHttpConnect failed, error=%d", GetLastError());
-            LogToFile(buf);
-            return false;
-        }
-        LogToFile(L"HttpClient: Connected successfully");
-        return true;
-    }
-
-    bool SendRequest(const std::wstring& method, const std::wstring& path,
-        const std::wstring& body = L"", const std::wstring& auth = L"") {
-
-        DWORD flags = useHttps ? WINHTTP_FLAG_SECURE : 0;
-        hRequest = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(),
-            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-
-        if (!hRequest) {
-            wchar_t buf[128];
-            wsprintf(buf, L"HttpClient: WinHttpOpenRequest failed, error=%d", GetLastError());
-            LogToFile(buf);
-            return false;
-        }
-
-        // Устанавливаем опции безопасности ТОЛЬКО через WinHttpSetOption,
-        // используя правильные константы SECURITY_FLAG_
-        if (useHttps) {
-            DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-                SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
-                SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
-                &securityFlags, sizeof(securityFlags));
-        }
-
-        // Заголовки
-        std::wstring hdrs = L"Content-Type: application/json; charset=utf-8\r\n";
-        if (!auth.empty()) {
-            hdrs += L"Authorization: Bearer " + auth + L"\r\n";
-        }
-
-        // Конвертация тела в UTF-8
-        std::string u8body;
-        if (!body.empty()) {
-            int l = WideCharToMultiByte(CP_UTF8, 0, body.c_str(),
-                (int)body.length(), NULL, 0, NULL, NULL);
-            if (l > 0) {
-                u8body.resize(l);
-                WideCharToMultiByte(CP_UTF8, 0, body.c_str(),
-                    (int)body.length(), &u8body[0], l, NULL, NULL);
-            }
-        }
-
-        LPCVOID bp = body.empty() ? WINHTTP_NO_REQUEST_DATA : u8body.c_str();
-        DWORD bl = body.empty() ? 0 : (DWORD)u8body.length();
-
-        LogToFile((L"HttpClient: Sending " + method + L" " + path).c_str());
-
-        if (!WinHttpSendRequest(hRequest, hdrs.c_str(), (DWORD)hdrs.length(),
-            (LPVOID)bp, bl, bl, 0))
-        {
-            wchar_t buf[128];
-            wsprintf(buf, L"HttpClient: WinHttpSendRequest failed, error=%d", GetLastError());
-            LogToFile(buf);
-            return false;
-        }
-
-        if (!WinHttpReceiveResponse(hRequest, NULL))
-        {
-            wchar_t buf[128];
-            wsprintf(buf, L"HttpClient: WinHttpReceiveResponse failed, error=%d", GetLastError());
-            LogToFile(buf);
-            return false;
-        }
-
-        LogToFile(L"HttpClient: Request sent and response received");
-        return true;
-    }
-
-    std::wstring GetResponse() {
-        std::wstring r;
-        DWORD s = 0, d = 0;
-        do {
-            s = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &s)) break;
-            if (s == 0) break;
-            std::vector<char> b(s + 1);
-            if (!WinHttpReadData(hRequest, b.data(), s, &d)) break;
-            if (d == 0) break;
-            int wl = MultiByteToWideChar(CP_UTF8, 0, b.data(), d, NULL, 0);
-            if (wl > 0) {
-                std::vector<wchar_t> wb(wl + 1);
-                MultiByteToWideChar(CP_UTF8, 0, b.data(), d, wb.data(), wl);
-                wb[wl] = L'\0';
-                r.append(wb.data());
-            }
-        } while (s > 0);
-        return r;
-    }
-
-    DWORD GetStatusCode() {
-        DWORD sc = 0;
-        DWORD size = sizeof(sc);
-        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &sc, &size, WINHTTP_NO_HEADER_INDEX);
-        return sc;
-    }
-};
 
 bool PerformLogin(const std::wstring& u, const std::wstring& p) {
     LogToFile(L"PerformLogin: Starting login...");
@@ -1793,7 +2446,8 @@ long ScanFile(handle_t h, const wchar_t* filePath, ScanResultData* result) {
             std::lock_guard<std::mutex> lock(g_AvDbMutex);
             auto it = g_AvDatabase.find(prefix);
             if (it != g_AvDatabase.end() && !it->second.empty()) {
-                const auto& record = it->second[0];
+                const auto& recordPtr = it->second[0];  // Это shared_ptr
+                const auto& record = *recordPtr;         // Разыменовываем
                 wsprintf(buf, L"ScanFile: Found in DB, DB hash: %02X%02X%02X%02X..., Match: %s",
                     record.objectSignature[0], record.objectSignature[1],
                     record.objectSignature[2], record.objectSignature[3],
@@ -2033,6 +2687,17 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
 
     StartRefreshThreads();
 
+    g_hUpdateEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_hUpdateEvent) {
+        LogToFile(L"[UPDATE] Failed to create update event");
+    }
+    else {
+        g_hUpdateThread = CreateThread(NULL, 0, UpdateThread, NULL, 0, NULL);
+        if (!g_hUpdateThread) {
+            LogToFile(L"[UPDATE] Failed to create update thread");
+        }
+    }
+
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
     g_ServiceStatus.dwCheckPoint = 0;
     g_ServiceStatus.dwWaitHint = 0;
@@ -2042,7 +2707,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
 
     {
         std::wstring dbPath = g_ServiceDirectory + L"\\av_database.bin";
-        if (LoadAndVerifyAvDatabase(dbPath, g_ServiceDirectory + L"\\public_key.pem")) {
+        if (LoadAndVerifyAvDatabase(dbPath, g_ServiceDirectory + L"\\public_key_cryptoapi.pem")) {
             // База загружена, дата уже установлена внутри LoadAndVerifyAvDatabase
             LogToFile(L"AV Database loaded successfully from file");
         }
@@ -2078,6 +2743,29 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
         WaitForSingleObject(hWorkerThread, 5000);
         CloseHandle(hWorkerThread);
         hWorkerThread = NULL;
+    }
+
+    if (g_hUpdateEvent) {
+        SetEvent(g_hUpdateEvent);
+    }
+
+    if (g_hUpdateThread) {
+        WaitForSingleObject(g_hUpdateThread, 5000);
+        CloseHandle(g_hUpdateThread);
+        g_hUpdateThread = NULL;
+    }
+
+    if (g_hUpdateEvent) {
+        CloseHandle(g_hUpdateEvent);
+        g_hUpdateEvent = NULL;
+    }
+
+    // Очистка временного криптоконтейнера
+    HCRYPTPROV hProv = 0;
+    LPCWSTR containerName = L"TrayAppTempContainer_{12345678-1234-1234-1234-123456789012}";
+    if (CryptAcquireContext(&hProv, containerName, MS_ENHANCED_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        CryptReleaseContext(hProv, 0);
+        CryptAcquireContext(&hProv, containerName, MS_ENHANCED_PROV, PROV_RSA_AES, CRYPT_DELETEKEYSET);
     }
 
     StopMonitoring();
