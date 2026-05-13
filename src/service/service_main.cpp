@@ -23,6 +23,8 @@
 #include <algorithm>  // для std::transform, std::min
 #include <ctime>      // для time_t, gmtime_s
 #include <cstring>    // для memcmp, memcpy
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
@@ -58,9 +60,8 @@
 
 
 const char* AVDB_PUBLIC_KEY_BLOB =
-"-----BEGIN PUBLIC KEY-----\n"
-"...base64...\n"
-"-----END PUBLIC KEY-----\n";
+"-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsXG6UrLzGfhkNPDyB5u6\nWetKgFMcb3Sb3pCW4TuaM5jX0bNIBC3tty2/TljHhUVsBNSi2Il/zkTo14GLS3Kz\nCq3dxRohGlHs7ix08DtK3TO0rAZW+1Hpi9kLZKIohdwxxilln8No1LJxiuVPjfaB\nrlpYEd9jTsmlXj15wEpX9Cl656InvrLN24ZvVrguWuivurPMHE4855duUhWLuiZb\nifT1FdY+5JsN19oqEgJjQFIZA4d25RAOWpKxDmAlgkuENGUpCT3eJmDsQdIn1ms4\nOoQ6Beir1OXc2r9BIUsMbDCkNXugustv7PpUnjlpNUkGhbU3fmE5zmpCsQaq/BE4\n8wIDAQAB\n-----END PUBLIC KEY-----\n";
+
 
 extern "C" {
     void* __RPC_USER MIDL_user_allocate(size_t size)
@@ -93,99 +94,86 @@ void LogToFile(const wchar_t* msg)
 HCRYPTKEY ImportPublicKey(const std::string& pemKey) {
     HCRYPTPROV hProv = 0;
     HCRYPTKEY hKey = 0;
+    wchar_t logBuf[512];
 
-    // Парсим PEM
     std::string base64Key;
-    const char* beginMarker = "-----BEGIN RSA PUBLIC KEY-----";
-    const char* endMarker = "-----END RSA PUBLIC KEY-----";
+    bool isX509Format = false;
 
-    size_t beginPos = pemKey.find(beginMarker);
-    size_t endPos = pemKey.find(endMarker);
-
-    if (beginPos != std::string::npos && endPos != std::string::npos) {
-        beginPos += strlen(beginMarker);
-        base64Key = pemKey.substr(beginPos, endPos - beginPos);
-        base64Key.erase(std::remove_if(base64Key.begin(), base64Key.end(),
-            [](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }),
-            base64Key.end());
+    if (pemKey.find("-----BEGIN RSA PUBLIC KEY-----") != std::string::npos) {
+        LogToFile(L"[CRYPTO] Detected RSA PUBLIC KEY format");
+    }
+    else if (pemKey.find("-----BEGIN PUBLIC KEY-----") != std::string::npos) {
+        isX509Format = true;
+        LogToFile(L"[CRYPTO] Detected X.509 PUBLIC KEY format");
     }
     else {
-        beginMarker = "-----BEGIN PUBLIC KEY-----";
-        endMarker = "-----END PUBLIC KEY-----";
-        beginPos = pemKey.find(beginMarker);
-        endPos = pemKey.find(endMarker);
-        if (beginPos != std::string::npos && endPos != std::string::npos) {
-            beginPos += strlen(beginMarker);
-            base64Key = pemKey.substr(beginPos, endPos - beginPos);
-            base64Key.erase(std::remove_if(base64Key.begin(), base64Key.end(),
-                [](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }),
-                base64Key.end());
-        }
-        else {
-            base64Key = pemKey;
-        }
-    }
-
-    // Декодируем base64
-    DWORD derLen = 0;
-    if (!CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
-        CRYPT_STRING_BASE64, NULL, &derLen, NULL, NULL)) {
-        LogToFile(L"[CRYPTO] Failed to decode base64");
+        LogToFile(L"[CRYPTO] Unknown format");
         return 0;
     }
+
+    const char* beginMarker = isX509Format ? "-----BEGIN PUBLIC KEY-----" : "-----BEGIN RSA PUBLIC KEY-----";
+    const char* endMarker = isX509Format ? "-----END PUBLIC KEY-----" : "-----END RSA PUBLIC KEY-----";
+
+    size_t start = pemKey.find(beginMarker) + strlen(beginMarker);
+    size_t end = pemKey.find(endMarker);
+    base64Key = pemKey.substr(start, end - start);
+
+    base64Key.erase(std::remove_if(base64Key.begin(), base64Key.end(),
+        [](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }),
+        base64Key.end());
+
+    DWORD derLen = 0;
+    CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
+        CRYPT_STRING_BASE64, NULL, &derLen, NULL, NULL);
 
     std::vector<BYTE> derKey(derLen);
-    if (!CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
-        CRYPT_STRING_BASE64, derKey.data(), &derLen, NULL, NULL)) {
-        LogToFile(L"[CRYPTO] Failed to decode base64");
-        return 0;
-    }
+    CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
+        CRYPT_STRING_BASE64, derKey.data(), &derLen, NULL, NULL);
 
-    // ВАЖНО: Используем ВРЕМЕННЫЙ контекст (CRYPT_VERIFYCONTEXT)
     if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        DWORD err = GetLastError();
-        wchar_t buf[256];
-        wsprintf(buf, L"[CRYPTO] CryptAcquireContext failed: %d", err);
-        LogToFile(buf);
-        return 0;
+        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            LogToFile(L"[CRYPTO] No crypto provider available");
+            return 0;
+        }
     }
 
-    // Импортируем ключ
-    CERT_PUBLIC_KEY_INFO* pPubKeyInfo = NULL;
-    DWORD cbPubKeyInfo = 0;
+    if (isX509Format) {
+        CERT_PUBLIC_KEY_INFO* pPubKeyInfo = NULL;
+        DWORD cbPubKeyInfo = 0;
 
-    BOOL decoded = CryptDecodeObjectEx(
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        X509_PUBLIC_KEY_INFO,
-        derKey.data(),
-        (DWORD)derKey.size(),
-        CRYPT_DECODE_ALLOC_FLAG,
-        NULL,
-        &pPubKeyInfo,
-        &cbPubKeyInfo
-    );
+        if (CryptDecodeObjectEx(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_PUBLIC_KEY_INFO,
+            derKey.data(), (DWORD)derKey.size(),
+            CRYPT_DECODE_ALLOC_FLAG, NULL,
+            &pPubKeyInfo, &cbPubKeyInfo))
+        {
+            wsprintf(logBuf, L"[CRYPTO] X.509 decoded OK, algorithm OID: %S",
+                pPubKeyInfo->Algorithm.pszObjId ? pPubKeyInfo->Algorithm.pszObjId : "NULL");
+            LogToFile(logBuf);
 
-    if (decoded) {
-        if (!CryptImportPublicKeyInfo(hProv, X509_ASN_ENCODING, pPubKeyInfo, &hKey)) {
-            DWORD err = GetLastError();
-            wchar_t buf[256];
-            wsprintf(buf, L"[CRYPTO] CryptImportPublicKeyInfo failed, error=%d", err);
-            LogToFile(buf);
+            if (!CryptImportPublicKeyInfo(hProv, X509_ASN_ENCODING, pPubKeyInfo, &hKey)) {
+                DWORD err = GetLastError();
+                wsprintf(logBuf, L"[CRYPTO] CryptImportPublicKeyInfo failed: 0x%08X", err);
+                LogToFile(logBuf);
+            }
+            else {
+                LogToFile(L"[CRYPTO] X.509 key imported successfully");
+            }
+            LocalFree(pPubKeyInfo);
         }
-        else {
-            LogToFile(L"[CRYPTO] Public key imported successfully");
-        }
-        LocalFree(pPubKeyInfo);
     }
     else {
-        DWORD err = GetLastError();
-        wchar_t buf[256];
-        wsprintf(buf, L"[CRYPTO] CryptDecodeObjectEx failed, error=%d", err);
-        LogToFile(buf);
+        if (!CryptImportKey(hProv, derKey.data(), (DWORD)derKey.size(), 0, 0, &hKey)) {
+            DWORD err = GetLastError();
+            wsprintf(logBuf, L"[CRYPTO] CryptImportKey (RSA) failed: 0x%08X", err);
+            LogToFile(logBuf);
+        }
+        else {
+            LogToFile(L"[CRYPTO] RSA key imported directly");
+        }
     }
 
-    // НЕ освобождаем контекст, пока используется ключ
-    // CryptReleaseContext(hProv, 0); — нужно вызывать ПОСЛЕ использования ключа
     return hKey;
 }
 
@@ -239,13 +227,6 @@ struct MonitoredDirectory {
     bool recursive;
     std::vector<uint8_t> buffer;
     OVERLAPPED overlapped;
-};
-
-// Добавьте определение перед использованием:
-struct ScanResultData {
-    long isMalicious;
-    long recordCount;
-    wchar_t* filePath;
 };
 
 std::vector<MonitoredDirectory> g_MonitoredDirs;
@@ -459,136 +440,143 @@ public:
 
 // Функция проверки целостности блока данных
 bool VerifySignature(BYTE* data, size_t dataSize, BYTE* signature, size_t sigSize, const std::string& publicKeyBlob) {
-
-    // Логируем входные параметры
     wchar_t buf[512];
     wsprintf(buf, L"[VERIFY] Input params: dataSize=%Iu, sigSize=%Iu", dataSize, sigSize);
     LogToFile(buf);
 
-    // Дамп данных для отладки
-    wsprintf(buf, L"[VERIFY] Data dump (%Iu bytes):", dataSize);
-    LogToFile(buf);
+    if (sigSize == 0 || signature == NULL) {
+        LogToFile(L"[AVDB] Empty signature - verification skipped");
+        return true;
+    }
 
+    // Дамп данных
     std::wstring hexDump;
-    for (size_t i = 0; i < min(dataSize, (size_t)64); i++) {
+    for (size_t i = 0; i < min(dataSize, (size_t)20); i++) {
         wchar_t hex[4];
         wsprintf(hex, L"%02X ", data[i]);
         hexDump += hex;
     }
-    LogToFile((LPWSTR)hexDump.c_str());
+    wsprintf(buf, L"[VERIFY] Data: %s", hexDump.c_str());
+    LogToFile(buf);
 
-    if (sigSize == 0 || signature == NULL) {
-        LogToFile(L"[AVDB] Empty signature - verification skipped (default database)");
+    // Парсим PEM ключ
+    std::string base64Key;
+    const char* beginMarker = "-----BEGIN PUBLIC KEY-----";
+    const char* endMarker = "-----END PUBLIC KEY-----";
+
+    size_t start = publicKeyBlob.find(beginMarker);
+    size_t end = publicKeyBlob.find(endMarker);
+
+    if (start == std::string::npos) {
+        beginMarker = "-----BEGIN RSA PUBLIC KEY-----";
+        endMarker = "-----END RSA PUBLIC KEY-----";
+        start = publicKeyBlob.find(beginMarker);
+        end = publicKeyBlob.find(endMarker);
+    }
+
+    if (start == std::string::npos) {
+        LogToFile(L"[VERIFY] No PEM markers found");
+        return false;
+    }
+
+    start += strlen(beginMarker);
+    base64Key = publicKeyBlob.substr(start, end - start);
+    base64Key.erase(std::remove_if(base64Key.begin(), base64Key.end(),
+        [](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }),
+        base64Key.end());
+
+    // Декодируем base64
+    DWORD derLen = 0;
+    CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
+        CRYPT_STRING_BASE64, NULL, &derLen, NULL, NULL);
+
+    std::vector<BYTE> derKey(derLen);
+    CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
+        CRYPT_STRING_BASE64, derKey.data(), &derLen, NULL, NULL);
+
+    // Вычисляем SHA-256 хеш данных
+    std::vector<BYTE> hash(32);
+    BCRYPT_ALG_HANDLE hHashAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+
+    if (BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) {
+        LogToFile(L"[VERIFY] BCryptOpenAlgorithmProvider failed");
+        return false;
+    }
+
+    BCryptCreateHash(hHashAlg, &hHash, NULL, 0, NULL, 0, 0);
+    BCryptHashData(hHash, data, (ULONG)dataSize, 0);
+    BCryptFinishHash(hHash, hash.data(), 32, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hHashAlg, 0);
+
+    wsprintf(buf, L"[VERIFY] SHA-256 hash: %02X%02X%02X%02X...",
+        hash[0], hash[1], hash[2], hash[3]);
+    LogToFile(buf);
+
+    // Импортируем публичный ключ через BCrypt
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    NTSTATUS status = BCryptImportKeyPair(
+        NULL,           // Используем стандартный провайдер
+        NULL,           // Без дескриптора
+        BCRYPT_RSAPUBLIC_BLOB,
+        &hKey,
+        derKey.data(),
+        (ULONG)derKey.size(),
+        0);
+
+    if (status != 0) {
+        wsprintf(buf, L"[VERIFY] BCryptImportKeyPair failed: 0x%08X", status);
+        LogToFile(buf);
+        return false;
+    }
+
+    // Верифицируем подпись
+    BCRYPT_PKCS1_PADDING_INFO paddingInfo = { 0 };
+    paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+
+    status = BCryptVerifySignature(
+        hKey,
+        &paddingInfo,
+        hash.data(),
+        32,
+        signature,
+        (ULONG)sigSize,
+        BCRYPT_PAD_PKCS1);
+
+    BCryptDestroyKey(hKey);
+
+    if (status == 0) {
+        LogToFile(L"[VERIFY] Signature verification SUCCESS (BCrypt)");
         return true;
     }
-
-    HCRYPTPROV hProv = 0;
-    HCRYPTHASH hHash = 0;
-    HCRYPTKEY hPublicKey = 0;
-    BOOL result = FALSE;
-
-    wsprintf(buf, L"[VERIFY] Starting verification, dataSize=%Iu, sigSize=%Iu", dataSize, sigSize);
-    LogToFile(buf);
-
-    // Получаем контекст
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        DWORD err = GetLastError();
-        wsprintf(buf, L"[VERIFY] CryptAcquireContext failed: 0x%08X", err);
-        LogToFile(buf);
-
-        // Пробуем с PROV_RSA_FULL
-        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-            err = GetLastError();
-            wsprintf(buf, L"[VERIFY] All attempts failed, error=0x%08X", err);
-            LogToFile(buf);
-            return false;
-        }
-        LogToFile(L"[VERIFY] Using PROV_RSA_FULL provider");
-    }
-
-    wsprintf(buf, L"[VERIFY] Context acquired: 0x%p", hProv);
-    LogToFile(buf);
-
-    // Создаем хеш - используем SHA-256 как в Python
-    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-        DWORD err = GetLastError();
-        wsprintf(buf, L"[VERIFY] SHA-256 failed: 0x%08X, trying SHA-1...", err);
-        LogToFile(buf);
-
-        if (!CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
-            err = GetLastError();
-            wsprintf(buf, L"[VERIFY] SHA-1 also failed: 0x%08X", err);
-            LogToFile(buf);
-            CryptReleaseContext(hProv, 0);
-            return false;
-        }
-        LogToFile(L"[VERIFY] Using SHA-1 (WARNING: Python uses SHA-256!)");
-    }
     else {
-        LogToFile(L"[VERIFY] Using SHA-256");
-    }
-
-    // Хешируем данные
-    if (!CryptHashData(hHash, data, (DWORD)dataSize, 0)) {
-        DWORD err = GetLastError();
-        wsprintf(buf, L"[VERIFY] CryptHashData failed: 0x%08X", err);
-        LogToFile(buf);
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        return false;
-    }
-    LogToFile(L"[VERIFY] Data hashed successfully");
-
-    // Импортируем публичный ключ
-    hPublicKey = ImportPublicKey(publicKeyBlob);
-    if (!hPublicKey) {
-        LogToFile(L"[VERIFY] Failed to import public key");
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        return false;
-    }
-
-    // Проверяем подпись (без реверсирования, т.к. Python не реверсирует)
-    result = CryptVerifySignature(hHash, signature, (DWORD)sigSize, hPublicKey, NULL, 0);
-
-    if (result) {
-        LogToFile(L"[VERIFY] Signature verification SUCCESS");
-    }
-    else {
-        DWORD err = GetLastError();
-        wsprintf(buf, L"[VERIFY] Signature verification FAILED, error=0x%08X", err);
+        wsprintf(buf, L"[VERIFY] BCryptVerifySignature failed: 0x%08X", status);
         LogToFile(buf);
 
-        // Попробуем с реверсированной подписью
-        LogToFile(L"[VERIFY] Trying with reversed signature...");
+        // Пробуем с реверсированной подписью
         std::vector<BYTE> reversedSig(sigSize);
         for (size_t i = 0; i < sigSize; i++) {
             reversedSig[i] = signature[sigSize - 1 - i];
         }
 
-        // Создаем новый хеш для второй попытки
-        HCRYPTHASH hHash2 = 0;
-        CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash2);
-        CryptHashData(hHash2, data, (DWORD)dataSize, 0);
+        // Заново импортируем ключ
+        BCryptImportKeyPair(NULL, NULL, BCRYPT_RSAPUBLIC_BLOB, &hKey, derKey.data(), (ULONG)derKey.size(), 0);
 
-        result = CryptVerifySignature(hHash2, reversedSig.data(), (DWORD)sigSize, hPublicKey, NULL, 0);
-        if (result) {
-            LogToFile(L"[VERIFY] Signature verification SUCCESS (reversed)");
+        status = BCryptVerifySignature(hKey, &paddingInfo, hash.data(), 32, reversedSig.data(), (ULONG)sigSize, BCRYPT_PAD_PKCS1);
+        BCryptDestroyKey(hKey);
+
+        if (status == 0) {
+            LogToFile(L"[VERIFY] SUCCESS with reversed signature (BCrypt)");
+            return true;
         }
         else {
-            err = GetLastError();
-            wsprintf(buf, L"[VERIFY] Reversed signature also FAILED: 0x%08X", err);
+            wsprintf(buf, L"[VERIFY] BCrypt reversed also failed: 0x%08X", status);
             LogToFile(buf);
         }
-        CryptDestroyHash(hHash2);
     }
 
-    // Освобождаем ресурсы
-    if (hPublicKey) CryptDestroyKey(hPublicKey);
-    if (hHash) CryptDestroyHash(hHash);
-    if (hProv) CryptReleaseContext(hProv, 0);
-
-    return result == TRUE;
+    return false;
 }
 
 bool CheckNetworkAvailability() {
@@ -2448,11 +2436,12 @@ long ScanFile(handle_t h, const wchar_t* filePath, ScanResultData* result) {
             if (it != g_AvDatabase.end() && !it->second.empty()) {
                 const auto& recordPtr = it->second[0];  // Это shared_ptr
                 const auto& record = *recordPtr;         // Разыменовываем
-                wsprintf(buf, L"ScanFile: Found in DB, DB hash: %02X%02X%02X%02X..., Match: %s",
+                wchar_t buf2[512];
+                wsprintf(buf2, L"ScanFile: Found in DB, DB hash: %02X%02X%02X%02X..., Match: %s",
                     record.objectSignature[0], record.objectSignature[1],
                     record.objectSignature[2], record.objectSignature[3],
                     hash == record.objectSignature ? L"YES" : L"NO");
-                LogToFile(buf);
+                LogToFile(buf2);
             }
             else {
                 LogToFile(L"ScanFile: Prefix not found in database");
