@@ -15,7 +15,6 @@ if(NOT nlohmann_json_FOUND)
     message(STATUS "nlohmann_json not found, will use FetchContent to download it")
     include(FetchContent)
     
-    # Save and restore policy settings for FetchContent
     cmake_policy(PUSH)
     cmake_policy(SET CMP0167 OLD)
     
@@ -25,16 +24,14 @@ if(NOT nlohmann_json_FOUND)
         GIT_TAG v3.11.2
     )
     
-    # Set this before FetchContent_MakeAvailable
     set(JSON_BuildTests OFF CACHE INTERNAL "")
-    
     FetchContent_MakeAvailable(nlohmann_json)
     cmake_policy(POP)
 endif()
 
 if(WIN32)
     # Common compile options
-    add_compile_options(/FS)  # Fix parallel build issues with RPC generated files
+    add_compile_options(/FS)
     
     # TrayService executable
     add_executable(TrayService WIN32
@@ -97,18 +94,10 @@ if(WIN32)
         rpcrt4
     )
     
-    # Set output directory for both targets
+    # Set output directory
     set_target_properties(TrayService TrayApp PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin/Debug"
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin/Release"
-    )
-    
-    # Copy dependencies to output directory after build
-    add_custom_command(TARGET TrayService POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_RUNTIME_DLLS:TrayService>"
-            "$<TARGET_FILE_DIR:TrayService>"
-        COMMAND_EXPAND_LISTS
     )
 endif()

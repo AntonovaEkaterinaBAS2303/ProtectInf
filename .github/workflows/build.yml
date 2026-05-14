@@ -97,22 +97,35 @@ jobs:
         $publishDir = "publish"
         New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
         
-        $buildBin = "build\bin\${{ matrix.configuration }}"
-        if (Test-Path $buildBin) {
-          Copy-Item "$buildBin\*.exe" $publishDir -Force -ErrorAction SilentlyContinue
-          Copy-Item "$buildBin\*.dll" $publishDir -Force -ErrorAction SilentlyContinue
-          Write-Host "Copied binaries from $buildBin"
+        # Find the build output directory
+        $buildBin = Get-ChildItem -Path "build\bin" -Recurse -Filter "TrayService.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($buildBin) {
+          $buildDir = $buildBin.DirectoryName
+          Copy-Item "$buildDir\*.exe" $publishDir -Force -ErrorAction SilentlyContinue
+          Copy-Item "$buildDir\*.dll" $publishDir -Force -ErrorAction SilentlyContinue
+          Write-Host "Copied binaries from $buildDir"
+        } else {
+          Write-Host "WARNING: Build output not found, searching..."
+          Get-ChildItem -Path "build" -Recurse -Filter "*.exe" | ForEach-Object {
+            Copy-Item $_.FullName $publishDir -Force
+            Write-Host "Copied $($_.Name)"
+          }
         }
         
         @("av_database.bin", "av_database.bin.bak", "public_key_cryptoapi.pem") | ForEach-Object {
           if (Test-Path $_) { 
             Copy-Item $_ $publishDir -Force
             Write-Host "Copied $_"
+          } else {
+            Write-Host "WARNING: $_ not found"
           }
         }
         
+        Write-Host "`nFiles in publish directory:"
         Get-ChildItem $publishDir | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+        
         Compress-Archive -Path "$publishDir\*" -DestinationPath "TrayApp-Installer.zip" -Force
+        Write-Host "`nPackage created: TrayApp-Installer.zip"
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
