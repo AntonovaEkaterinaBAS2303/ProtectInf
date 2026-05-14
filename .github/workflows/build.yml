@@ -1,0 +1,42 @@
+name: Build TrayApp Windows Service
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure CMake
+      run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+    
+    - name: Build project
+      run: cmake --build build --config Release --parallel
+    
+    - name: List artifacts
+      run: dir build\bin\Release\*.exe
+    
+    - name: Upload TrayService.exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: TrayService-${{ github.sha }}
+        path: build/bin/Release/TrayService.exe
+    
+    - name: Upload TrayApp.exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: TrayApp-${{ github.sha }}
+        path: build/bin/Release/TrayApp.exe
+    
+    - name: Upload all artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: TrayApp-full-${{ github.sha }}
+        path: build/bin/Release/
