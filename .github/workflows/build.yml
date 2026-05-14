@@ -1,42 +1,105 @@
-name: Build TrayApp Windows Service
+﻿name: Build and Package TrayApp
 
 on:
   push:
-    branches: ['**']
+    branches: [ main, master ]
   pull_request:
-    branches: ['**']
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     
+    strategy:
+      matrix:
+        configuration: [Release]
+        platform: [x64]
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+    
+    - name: Setup CMake
+      uses: lukka/get-cmake@latest
+    
+    - name: Setup vcpkg
+      run: |
+        git clone https://github.com/Microsoft/vcpkg.git ${{ github.workspace }}/vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat
+        .\vcpkg\vcpkg install --triplet x64-windows
     
     - name: Configure CMake
-      run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+      run: |
+        cmake -B build -S . `
+          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake `
+          -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} `
+          -A x64
     
-    - name: Build project
-      run: cmake --build build --config Release --parallel
+    - name: Build
+      run: cmake --build build --config ${{ matrix.configuration }}
     
-    - name: List artifacts
-      run: dir build\bin\Release\*.exe
+    - name: Generate AV Database
+      run: |
+        pip install cryptography
+        python sign_av_db.py
+      working-directory: ${{ github.workspace }}
     
-    - name: Upload TrayService.exe
+    - name: Create installer package
+      run: |
+        $publishDir = "publish"
+        New-Item -ItemType Directory -Path $publishDir -Force
+        
+        # Copy binaries
+        Copy-Item "build\bin\${{ matrix.configuration }}\*.exe" $publishDir -Force
+        Copy-Item "build\bin\${{ matrix.configuration }}\*.dll" $publishDir -Force
+        
+        # Copy database and keys
+        Copy-Item "av_database.bin" $publishDir -Force
+        Copy-Item "av_database.bin" "$publishDir\av_database.bin.bak" -Force
+        Copy-Item "public_key_cryptoapi.pem" $publishDir -Force
+        
+        # Copy installer script
+        Copy-Item "Install-TrayApp.ps1" $publishDir -Force
+        
+        # Create ZIP archive
+        Compress-Archive -Path "$publishDir\*" -DestinationPath "TrayApp-Installer.zip" -Force
+        
+        Write-Host "Package created: TrayApp-Installer.zip"
+        Get-ChildItem $publishDir | ForEach-Object { Write-Host "  $($_.Name)" }
+    
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: TrayService-${{ github.sha }}
-        path: build/bin/Release/TrayService.exe
+        name: TrayApp-Installer
+        path: |
+          TrayApp-Installer.zip
+          publish/*
     
-    - name: Upload TrayApp.exe
-      uses: actions/upload-artifact@v4
+    - name: Create Release
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+      uses: softprops/action-gh-release@v2
       with:
-        name: TrayApp-${{ github.sha }}
-        path: build/bin/Release/TrayApp.exe
-    
-    - name: Upload all artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: TrayApp-full-${{ github.sha }}
-        path: build/bin/Release/
+        files: TrayApp-Installer.zip
+        name: TrayApp Build ${{ github.run_number }}
+        tag_name: build-${{ github.run_number }}
+        body: |
+          Automated build from ${{ github.sha }}
+          
+          ## Installation
+          1. Extract TrayApp-Installer.zip
+          2. Run Install-TrayApp.ps1 as Administrator
+          
+          ## Files Included
+          - TrayService.exe (Windows Service)
+          - TrayApp.exe (Client Application)
+          - av_database.bin (AV Signatures)
+          - public_key_cryptoapi.pem (Public Key)
+          - Install-TrayApp.ps1 (Installer)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
