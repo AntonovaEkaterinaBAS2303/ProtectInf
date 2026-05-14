@@ -20,30 +20,15 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
-    
-    - name: Setup CMake
-      uses: lukka/get-cmake@latest
-    
-    - name: Setup vcpkg
-      run: |
-        git clone https://github.com/Microsoft/vcpkg.git ${{ github.workspace }}/vcpkg
-        .\vcpkg\bootstrap-vcpkg.bat
-        .\vcpkg\vcpkg install nlohmann-json --triplet x64-windows
-      shell: pwsh
-    
     - name: Install Python dependencies
       run: pip install cryptography
     
     - name: Configure CMake
       run: |
         cmake -B build -S . `
-          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake `
           -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} `
           -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
           -A x64
-      shell: pwsh
     
     - name: Build
       run: cmake --build build --config ${{ matrix.configuration }}
@@ -123,21 +108,14 @@ jobs:
           if (Test-Path $_) { 
             Copy-Item $_ $publishDir -Force
             Write-Host "Copied $_"
-          } else {
-            Write-Host "WARNING: $_ not found"
           }
         }
         
-        Write-Host "Files in publish directory:"
         Get-ChildItem $publishDir | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
-        
         Compress-Archive -Path "$publishDir\*" -DestinationPath "TrayApp-Installer.zip" -Force
-        Write-Host "Package created: TrayApp-Installer.zip"
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: TrayApp-Installer
-        path: |
-          TrayApp-Installer.zip
-          publish/*
+        path: TrayApp-Installer.zip

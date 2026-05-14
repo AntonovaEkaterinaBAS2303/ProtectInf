@@ -4,20 +4,38 @@ project(WindowsServiceApp VERSION 1.0 LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Fix for nlohmann_json compatibility with newer CMake
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.20")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "")
+endif()
+
 # Find or download nlohmann_json
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
     message(STATUS "nlohmann_json not found, will use FetchContent to download it")
     include(FetchContent)
+    
+    # Save and restore policy settings for FetchContent
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0167 OLD)
+    
     FetchContent_Declare(
         nlohmann_json
         GIT_REPOSITORY https://github.com/nlohmann/json.git
         GIT_TAG v3.11.2
     )
+    
+    # Set this before FetchContent_MakeAvailable
+    set(JSON_BuildTests OFF CACHE INTERNAL "")
+    
     FetchContent_MakeAvailable(nlohmann_json)
+    cmake_policy(POP)
 endif()
 
 if(WIN32)
+    # Common compile options
+    add_compile_options(/FS)  # Fix parallel build issues with RPC generated files
+    
     # TrayService executable
     add_executable(TrayService WIN32
         src/service/service_main.cpp
@@ -45,10 +63,10 @@ if(WIN32)
         userenv 
         rpcrt4
         winhttp
+        wininet
+        crypt32
+        bcrypt
     )
-    
-    # Add WINHTTP library for HTTPS requests
-    target_link_libraries(TrayService PRIVATE winhttp)
     
     # TrayApp executable
     add_executable(TrayApp WIN32
@@ -86,13 +104,11 @@ if(WIN32)
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin/Release"
     )
     
-    # Set additional properties for TrayService
-    set_target_properties(TrayService PROPERTIES
-        WIN32_EXECUTABLE TRUE
-    )
-    
-    # Set additional properties for TrayApp
-    set_target_properties(TrayApp PROPERTIES
-        WIN32_EXECUTABLE TRUE
+    # Copy dependencies to output directory after build
+    add_custom_command(TARGET TrayService POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_RUNTIME_DLLS:TrayService>"
+            "$<TARGET_FILE_DIR:TrayService>"
+        COMMAND_EXPAND_LISTS
     )
 endif()
