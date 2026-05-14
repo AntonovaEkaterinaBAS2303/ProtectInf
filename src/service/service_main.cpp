@@ -494,89 +494,144 @@ bool VerifySignature(BYTE* data, size_t dataSize, BYTE* signature, size_t sigSiz
     CryptStringToBinaryA(base64Key.c_str(), (DWORD)base64Key.length(),
         CRYPT_STRING_BASE64, derKey.data(), &derLen, NULL, NULL);
 
-    // Вычисляем SHA-256 хеш данных
-    std::vector<BYTE> hash(32);
-    BCRYPT_ALG_HANDLE hHashAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
+    // Получаем криптопровайдер
+    HCRYPTPROV hProv = 0;
+    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            LogToFile(L"[VERIFY] No crypto provider");
+            return false;
+        }
+    }
 
-    if (BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) {
-        LogToFile(L"[VERIFY] BCryptOpenAlgorithmProvider failed");
+    // Декодируем X.509 и импортируем ключ
+    CERT_PUBLIC_KEY_INFO* pPubKeyInfo = NULL;
+    DWORD cbPubKeyInfo = 0;
+
+    if (!CryptDecodeObjectEx(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        X509_PUBLIC_KEY_INFO,
+        derKey.data(), (DWORD)derKey.size(),
+        CRYPT_DECODE_ALLOC_FLAG, NULL,
+        &pPubKeyInfo, &cbPubKeyInfo))
+    {
+        wsprintf(buf, L"[VERIFY] X.509 decode failed: 0x%08X", GetLastError());
+        LogToFile(buf);
+        CryptReleaseContext(hProv, 0);
         return false;
     }
 
-    BCryptCreateHash(hHashAlg, &hHash, NULL, 0, NULL, 0, 0);
-    BCryptHashData(hHash, data, (ULONG)dataSize, 0);
-    BCryptFinishHash(hHash, hash.data(), 32, 0);
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hHashAlg, 0);
+    HCRYPTKEY hPublicKey = 0;
+    if (!CryptImportPublicKeyInfo(hProv, X509_ASN_ENCODING, pPubKeyInfo, &hPublicKey)) {
+        wsprintf(buf, L"[VERIFY] Import key failed: 0x%08X", GetLastError());
+        LogToFile(buf);
+        LocalFree(pPubKeyInfo);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+    LocalFree(pPubKeyInfo);
 
-    wsprintf(buf, L"[VERIFY] SHA-256 hash: %02X%02X%02X%02X...",
-        hash[0], hash[1], hash[2], hash[3]);
+    LogToFile(L"[VERIFY] Key imported successfully");
+
+    // === РУЧНАЯ ВЕРИФИКАЦИЯ ПОДПИСИ ===
+    // 1. Вычисляем хеш данных
+    HCRYPTHASH hHash = 0;
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        LogToFile(L"[VERIFY] CryptCreateHash failed");
+        CryptDestroyKey(hPublicKey);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+
+    if (!CryptHashData(hHash, data, (DWORD)dataSize, 0)) {
+        LogToFile(L"[VERIFY] CryptHashData failed");
+        CryptDestroyHash(hHash);
+        CryptDestroyKey(hPublicKey);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+
+    // 2. Получаем хеш
+    BYTE hashValue[32] = { 0 };
+    DWORD hashLen = 32;
+    CryptGetHashParam(hHash, HP_HASHVAL, hashValue, &hashLen, 0);
+
+    wsprintf(buf, L"[VERIFY] Hash: %02X%02X%02X%02X%02X%02X%02X%02X...",
+        hashValue[0], hashValue[1], hashValue[2], hashValue[3],
+        hashValue[4], hashValue[5], hashValue[6], hashValue[7]);
     LogToFile(buf);
 
-    // Импортируем публичный ключ через BCrypt
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    NTSTATUS status = BCryptImportKeyPair(
-        NULL,           // Используем стандартный провайдер
-        NULL,           // Без дескриптора
-        BCRYPT_RSAPUBLIC_BLOB,
-        &hKey,
-        derKey.data(),
-        (ULONG)derKey.size(),
-        0);
+    // 3. Копируем подпись и "расшифровываем" её
+    std::vector<BYTE> sigCopy(signature, signature + sigSize);
+    DWORD decryptedLen = (DWORD)sigCopy.size();
 
-    if (status != 0) {
-        wsprintf(buf, L"[VERIFY] BCryptImportKeyPair failed: 0x%08X", status);
-        LogToFile(buf);
-        return false;
-    }
+    // Пробуем CryptDecrypt
+    BOOL decryptResult = CryptDecrypt(hPublicKey, 0, TRUE, 0, sigCopy.data(), &decryptedLen);
 
-    // Верифицируем подпись
-    BCRYPT_PKCS1_PADDING_INFO paddingInfo = { 0 };
-    paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+    if (decryptResult && decryptedLen >= 32) {
+        // PKCS#1 v1.5 структура: 00 01 FF...FF 00 DER(SHA-256) HASH
+        // Ищем 0x00 разделитель с конца
+        BYTE* hashInSig = NULL;
+        for (int i = decryptedLen - 34; i >= 0; i--) {
+            if (sigCopy[i] == 0x00) {
+                hashInSig = sigCopy.data() + i + 1;
+                break;
+            }
+        }
 
-    status = BCryptVerifySignature(
-        hKey,
-        &paddingInfo,
-        hash.data(),
-        32,
-        signature,
-        (ULONG)sigSize,
-        BCRYPT_PAD_PKCS1);
+        if (hashInSig) {
+            // SHA-256 OID: 30 31 30 0D 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20
+            // Хеш начинается после этого DER-заголовка
+            BYTE* hashStart = hashInSig;
+            // Пропускаем DER-заголовок (обычно 19 байт для SHA-256)
+            if (decryptedLen - (hashStart - sigCopy.data()) >= 32 + 19) {
+                hashStart += 19;
+            }
+            else if (decryptedLen - (hashStart - sigCopy.data()) >= 32) {
+                // Если DER-заголовок короче
+                hashStart = sigCopy.data() + decryptedLen - 32;
+            }
 
-    BCryptDestroyKey(hKey);
+            wsprintf(buf, L"[VERIFY] Sig hash: %02X%02X%02X%02X...",
+                hashStart[0], hashStart[1], hashStart[2], hashStart[3]);
+            LogToFile(buf);
 
-    if (status == 0) {
-        LogToFile(L"[VERIFY] Signature verification SUCCESS (BCrypt)");
-        return true;
+            if (memcmp(hashStart, hashValue, 32) == 0) {
+                LogToFile(L"[VERIFY] Manual verification SUCCESS!");
+                CryptDestroyHash(hHash);
+                CryptDestroyKey(hPublicKey);
+                CryptReleaseContext(hProv, 0);
+                return true;
+            }
+            LogToFile(L"[VERIFY] Hash mismatch");
+        }
     }
     else {
-        wsprintf(buf, L"[VERIFY] BCryptVerifySignature failed: 0x%08X", status);
+        wsprintf(buf, L"[VERIFY] CryptDecrypt failed: 0x%08X, len=%lu",
+            GetLastError(), decryptedLen);
         LogToFile(buf);
+    }
 
-        // Пробуем с реверсированной подписью
+    // Fallback: пробуем стандартную верификацию
+    LogToFile(L"[VERIFY] Trying standard CryptVerifySignature...");
+    BOOL result = CryptVerifySignature(hHash, signature, (DWORD)sigSize, hPublicKey, NULL, 0);
+
+    if (!result) {
+        // Пробуем reversed
         std::vector<BYTE> reversedSig(sigSize);
         for (size_t i = 0; i < sigSize; i++) {
             reversedSig[i] = signature[sigSize - 1 - i];
         }
-
-        // Заново импортируем ключ
-        BCryptImportKeyPair(NULL, NULL, BCRYPT_RSAPUBLIC_BLOB, &hKey, derKey.data(), (ULONG)derKey.size(), 0);
-
-        status = BCryptVerifySignature(hKey, &paddingInfo, hash.data(), 32, reversedSig.data(), (ULONG)sigSize, BCRYPT_PAD_PKCS1);
-        BCryptDestroyKey(hKey);
-
-        if (status == 0) {
-            LogToFile(L"[VERIFY] SUCCESS with reversed signature (BCrypt)");
-            return true;
-        }
-        else {
-            wsprintf(buf, L"[VERIFY] BCrypt reversed also failed: 0x%08X", status);
-            LogToFile(buf);
-        }
+        result = CryptVerifySignature(hHash, reversedSig.data(), (DWORD)sigSize, hPublicKey, NULL, 0);
+        if (result) LogToFile(L"[VERIFY] Standard SUCCESS with reversed!");
+    }
+    else {
+        LogToFile(L"[VERIFY] Standard verification SUCCESS");
     }
 
-    return false;
+    CryptDestroyHash(hHash);
+    CryptDestroyKey(hPublicKey);
+    CryptReleaseContext(hProv, 0);
+    return result == TRUE;
 }
 
 bool CheckNetworkAvailability() {
