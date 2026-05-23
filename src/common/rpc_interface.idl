@@ -1,0 +1,65 @@
+[
+    uuid(12345678-1234-1234-1234-123456789ABC),
+    version(1.0),
+    pointer_default(unique)
+]
+interface ServiceControl
+{
+    void StopService([in] handle_t hBinding);
+    long GetStatus([in] handle_t hBinding);
+    void Shutdown([in] handle_t hBinding);
+    long GetUserInfo([in] handle_t hBinding, [out, string] wchar_t** username);
+    long Login([in] handle_t hBinding, [in, string] const wchar_t* username, [in, string] const wchar_t* password);
+    long Logout(
+        [in] handle_t IDL_handle
+    );
+    long GetLicenseInfo([in] handle_t hBinding, [out] long* daysRemaining, [out, string] wchar_t** expiryDate);
+    long ActivateProduct([in] handle_t hBinding, [in, string] const wchar_t* activationKey);
+    // Результат сканирования
+    typedef struct {
+        long isMalicious;
+        [string] wchar_t* filePath;
+        long recordCount;
+    } ScanResultData;
+
+    // Информация о базах
+    typedef struct {
+        [string] wchar_t* releaseDate;
+        long recordCount;
+    } AvDbInfo;
+
+    // Новые функции
+    long ScanFile(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* filePath,
+        [out] ScanResultData* result
+    );
+
+    long ScanDirectory(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* dirPath,
+        [out] ScanResultData* results,
+        [out] long* resultCount
+    );
+
+    long GetAvDbInfo(
+        [in] handle_t hBinding,
+        [out] AvDbInfo* info
+    );
+
+    long AddMonitoredDir(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* dirPath,
+        [in] long recursive
+    );
+
+    long RemoveMonitoredDir(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* dirPath
+    );
+
+    long GetMonitoredDirs(
+        [in] handle_t hBinding,
+        [out, string] wchar_t** dirList
+    );
+}

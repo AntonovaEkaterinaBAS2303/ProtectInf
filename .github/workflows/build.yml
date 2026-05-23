@@ -1,0 +1,134 @@
+﻿name: Build and Package TrayApp
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    strategy:
+      matrix:
+        configuration: [Release]
+        platform: [x64]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install Python dependencies
+      run: pip install cryptography
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -S . `
+          -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} `
+          -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
+          -A x64
+    
+    - name: Build
+      run: cmake --build build --config ${{ matrix.configuration }}
+    
+    - name: Generate AV Database
+      shell: pwsh
+      run: |
+        python -c @"
+        import struct, hashlib, os, subprocess
+        from datetime import datetime
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        if not os.path.exists('private_key.pem'):
+            subprocess.run(['openssl', 'genrsa', '-out', 'private_key.pem', '2048'], check=True)
+            subprocess.run(['openssl', 'rsa', '-in', 'private_key.pem', '-pubout', '-out', 'public_key.pem'], check=True)
+            subprocess.run(['openssl', 'rsa', '-in', 'private_key.pem', '-pubout', '-out', 'public_key_cryptoapi.pem'], check=True)
+            print('Keys generated')
+
+        with open('private_key.pem', 'rb') as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+        records = [
+            (0x41402550214F3558, b'X5O!P%@A', 0, 68, 1),
+            (0x53207265776F5000, b'PowerShell', 0, 23, 6),
+            (0x00206F6863654045, b'@echo Virus', 0, 16, 1),
+        ]
+
+        magic = b'AVDB'
+        version = 1
+        timestamp = int(datetime.now().timestamp())
+        record_count = len(records)
+
+        manifest_data = magic + struct.pack('<I', version) + struct.pack('<Q', timestamp) + struct.pack('<I', record_count)
+        manifest_sig = private_key.sign(manifest_data, padding.PKCS1v15(), hashes.SHA256())
+
+        with open('av_database.bin', 'wb') as f:
+            f.write(magic)
+            f.write(struct.pack('<I', version))
+            f.write(struct.pack('<Q', timestamp))
+            f.write(struct.pack('<I', record_count))
+            f.write(struct.pack('<I', 0))
+            f.write(struct.pack('<I', len(manifest_sig)))
+            f.write(manifest_sig)
+            
+            for prefix, sig_data, off_begin, off_end, obj_type in records:
+                record_data = struct.pack('<Q', prefix)
+                record_data += struct.pack('<I', len(sig_data))
+                record_data += sig_data
+                record_data += struct.pack('<Q', off_begin)
+                record_data += struct.pack('<Q', off_end)
+                record_data += struct.pack('<I', obj_type)
+                record_sig = private_key.sign(record_data, padding.PKCS1v15(), hashes.SHA256())
+                f.write(record_data)
+                f.write(struct.pack('<I', len(record_sig)))
+                f.write(record_sig)
+
+        import shutil
+        shutil.copy('av_database.bin', 'av_database.bin.bak')
+        print(f'Database: av_database.bin ({os.path.getsize("av_database.bin")} bytes, {record_count} records)')
+        "@
+    
+    - name: Create installer package
+      shell: pwsh
+      run: |
+        $publishDir = "publish"
+        New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
+        
+        # Find the build output directory
+        $buildBin = Get-ChildItem -Path "build\bin" -Recurse -Filter "TrayService.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($buildBin) {
+          $buildDir = $buildBin.DirectoryName
+          Copy-Item "$buildDir\*.exe" $publishDir -Force -ErrorAction SilentlyContinue
+          Copy-Item "$buildDir\*.dll" $publishDir -Force -ErrorAction SilentlyContinue
+          Write-Host "Copied binaries from $buildDir"
+        } else {
+          Write-Host "WARNING: Build output not found, searching..."
+          Get-ChildItem -Path "build" -Recurse -Filter "*.exe" | ForEach-Object {
+            Copy-Item $_.FullName $publishDir -Force
+            Write-Host "Copied $($_.Name)"
+          }
+        }
+        
+        @("av_database.bin", "av_database.bin.bak", "public_key_cryptoapi.pem") | ForEach-Object {
+          if (Test-Path $_) { 
+            Copy-Item $_ $publishDir -Force
+            Write-Host "Copied $_"
+          } else {
+            Write-Host "WARNING: $_ not found"
+          }
+        }
+        
+        Write-Host "`nFiles in publish directory:"
+        Get-ChildItem $publishDir | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+        
+        Compress-Archive -Path "$publishDir\*" -DestinationPath "TrayApp-Installer.zip" -Force
+        Write-Host "`nPackage created: TrayApp-Installer.zip"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: TrayApp-Installer
+        path: TrayApp-Installer.zip
